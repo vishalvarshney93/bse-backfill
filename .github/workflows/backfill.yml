@@ -1,0 +1,35 @@
+name: Backfill BSE Bhavcopy History
+
+# Manual trigger only until proven reliable — add a `schedule:` cron once
+# a few runs have been spot-checked (see script docstring for verification
+# steps). Requires repo secret AZURE_STORAGE_CONNECTION_STRING.
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Backfill start date (YYYY-MM-DD)"
+        required: false
+        default: "2026-01-01"
+      end_date:
+        description: "Backfill end date (YYYY-MM-DD, blank = today)"
+        required: false
+        default: ""
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python backfill_bhavcopy_history.py
+        env:
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          BACKFILL_START_DATE: ${{ github.event.inputs.start_date }}
+          BACKFILL_END_DATE: ${{ github.event.inputs.end_date }}
