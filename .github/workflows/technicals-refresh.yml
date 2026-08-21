@@ -13,10 +13,16 @@ jobs:
           APP_URL: ${{ secrets.NEXT_PUBLIC_APP_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
+          # GitHub Actions runs this step under `bash -e` (and pipefail) by
+          # default, so curl's own non-zero exit on a timeout/failure would
+          # normally abort the ENTIRE loop after batch 1, silently skipping
+          # every remaining batch. `|| true` on the curl line keeps a single
+          # slow/failed batch from sinking the whole run — the next 20s-later
+          # iteration just tries again with the next 100 companies.
           for i in $(seq 1 60); do
             echo "Batch $i"
-            curl -sS --max-time 55 -w "\nHTTP_STATUS:%{http_code}\n" \
+            curl -sS --max-time 65 -w "\nHTTP_STATUS:%{http_code}\n" \
               -H "Authorization: Bearer $CRON_SECRET" \
-              "$APP_URL/api/companies/technicals/refresh?batchSize=100"
+              "$APP_URL/api/companies/technicals/refresh?batchSize=100" || true
             sleep 20
           done
