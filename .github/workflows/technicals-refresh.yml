@@ -18,11 +18,19 @@ jobs:
           # normally abort the ENTIRE loop after batch 1, silently skipping
           # every remaining batch. `|| true` on the curl line keeps a single
           # slow/failed batch from sinking the whole run — the next 20s-later
-          # iteration just tries again with the next 100 companies.
-          for i in $(seq 1 60); do
+          # iteration just tries again with the next batch of companies.
+          #
+          # batchSize halved 100->50 (and loop count doubled 60->120 to still
+          # cover the full ~5,000-company universe in one run): the 2026-08-22
+          # run saw intermittent "Backend call failure"/500s on isolated
+          # batches (batches 1 and 9 of 60), most likely per-invocation
+          # memory/CPU pressure on Azure's Consumption plan tipping over
+          # occasionally — halving the batch size directly reduces that
+          # pressure per call.
+          for i in $(seq 1 120); do
             echo "Batch $i"
             curl -sS --max-time 65 -w "\nHTTP_STATUS:%{http_code}\n" \
               -H "Authorization: Bearer $CRON_SECRET" \
-              "$APP_URL/api/companies/technicals/refresh?batchSize=100" || true
+              "$APP_URL/api/companies/technicals/refresh?batchSize=50" || true
             sleep 20
           done
