@@ -15,7 +15,7 @@ jobs:
         run: |
           for i in $(seq 1 60); do
             echo "Batch $i"
-            curl -sf --max-time 55 \
+            curl -sS --max-time 55 -w "\nHTTP_STATUS:%{http_code}\n" \
               -H "Authorization: Bearer $CRON_SECRET" \
               "$APP_URL/api/companies/technicals/refresh?batchSize=100"
             sleep 20
