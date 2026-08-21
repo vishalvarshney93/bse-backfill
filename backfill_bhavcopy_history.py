@@ -12,10 +12,12 @@ choice: a single day's ~5000 companies each land in a DIFFERENT partition,
 so Table Storage's same-partition batch API can't be used for a daily
 backfill — writes are issued concurrently instead (see WRITE_CONCURRENCY).
 
-Only BSE_BHAVCOPY_URL_TEMPLATE's current UDiFF format (post ~2024) is
-verified. Do not extend START_DATE before that era without first confirming
-the legacy URL/column format the same way the current one was (browser
-DevTools), per the existing NOTE in bse-trader's function_app.py.
+Both BHAVCOPY_URL_TEMPLATE (UDiFF, 2024-01-01 onward) and
+LEGACY_BHAVCOPY_URL_TEMPLATE (EQ{ddmmyy}_CSV.ZIP, verified live back through
+2020) are supported \u2014 _fetch_bhavcopy() picks automatically based on
+LEGACY_FORMAT_CUTOVER_DATE. Both share the same column layout
+(BHAVCOPY_COLUMN_ALIASES), so no parsing changes were needed for the legacy
+era, only the URL/date-format selection.
 
 Required env var: AZURE_STORAGE_CONNECTION_STRING (secret, never log it).
 Optional env vars: BACKFILL_START_DATE (default 2026-01-01), BACKFILL_END_DATE
@@ -47,6 +49,18 @@ BHAVCOPY_URL_TEMPLATE = os.environ.get(
     "BHAVCOPY_URL_TEMPLATE",
     "https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_{yyyymmdd}_F_0000.CSV",
 ).strip()
+# BSE switched to the UDiFF format above starting 2024-01-01 (verified via
+# live probe: UDiFF returns real data from 2024-01-01 onward but a fake-200
+# placeholder page for 2023-12-29; this legacy .zip endpoint returns real
+# data at least back through 2020 and is still served in parallel today).
+# Same column layout as the UDiFF file (SC_CODE/OPEN/HIGH/LOW/CLOSE/
+# PREVCLOSE/NO_OF_SHRS) — already covered by BHAVCOPY_COLUMN_ALIASES below,
+# no parsing changes needed, only the URL/date-format selection.
+LEGACY_BHAVCOPY_URL_TEMPLATE = os.environ.get(
+    "LEGACY_BHAVCOPY_URL_TEMPLATE",
+    "https://www.bseindia.com/download/BhavCopy/Equity/EQ{ddmmyy}_CSV.ZIP",
+).strip()
+LEGACY_FORMAT_CUTOVER_DATE = date(2024, 1, 1)
 TABLE_NAME = os.environ.get("BHAVCOPY_HISTORY_TABLE_NAME", "BhavcopyHistory").strip()
 REQUEST_SLEEP_SECONDS = float(os.environ.get("REQUEST_SLEEP_SECONDS", "1"))
 WRITE_CONCURRENCY = int(os.environ.get("WRITE_CONCURRENCY", "16"))
@@ -155,7 +169,10 @@ class HolidayOrMissingFile(Exception):
     reraise=True,
 )
 def _fetch_bhavcopy(trade_date: date) -> bytes:
-    url = BHAVCOPY_URL_TEMPLATE.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
+    if trade_date < LEGACY_FORMAT_CUTOVER_DATE:
+        url = LEGACY_BHAVCOPY_URL_TEMPLATE.format(ddmmyy=trade_date.strftime("%d%m%y"))
+    else:
+        url = BHAVCOPY_URL_TEMPLATE.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
     if resp.status_code != 200:
         raise HolidayOrMissingFile(f"{url} -> HTTP {resp.status_code}")
