@@ -1,7 +1,7 @@
 name: Technicals Cache Refresh
 on:
   schedule:
-    - cron: '30 10 * * *'  # 10:30 UTC = 4:00pm IST
+    - cron: '30 12 * * 1-5'  # 12:30 UTC = 6:00pm IST, weekdays only
   workflow_dispatch: {}
 jobs:
   refresh:
