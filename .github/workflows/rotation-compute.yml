@@ -2,7 +2,7 @@ name: Sector Rotation Weekly Compute
 
 on:
   schedule:
-    - cron: '0 3 * * 1' # 01:00 UTC every Monday (~6:30am IST), one week's data per run
+    - cron: '0 3 * * 1' # 03:00 UTC every Monday (~8:30am IST), one week's data per run
   workflow_dispatch: {} # allows manual "Run workflow" trigger from the Actions tab
 
 jobs:
@@ -11,5 +11,5 @@ jobs:
     steps:
       - name: Trigger rotation snapshot compute
         run: |
-          curl -sf -X POST "${{ secrets.NEXT_PUBLIC_APP_URL }}/api/market-scans/rotation/compute" \
+          curl -sf -X GET "${{ secrets.NEXT_PUBLIC_APP_URL }}/api/market-scans/rotation/compute" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
