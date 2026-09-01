@@ -419,28 +419,60 @@ class NvidiaClient:
         max_tokens: int = 2000,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        temperature: float = 0.1,
+        top_p: float = 0.95,
+        enable_thinking: bool = False,
+        reasoning_budget: int | None = None,
+        stream: bool = False,
     ) -> dict[str, Any]:
         requested_model = model or self.model
+        payload: dict[str, Any] = {
+            "model": requested_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "stream": stream,
+        }
+        if reasoning_budget is not None:
+            payload["reasoning_budget"] = reasoning_budget
         response = self.session.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json={
-                "model": requested_model,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "temperature": 0.1,
-                "max_tokens": max_tokens,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            json=payload,
             timeout=timeout_seconds or self.synthesis_timeout,
+            stream=stream,
         )
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
             raise NvidiaRequestError(requested_model, response.status_code) from exc
-        choice = response.json()["choices"][0]
-        if choice.get("finish_reason") == "length":
+        if stream:
+            content_parts: list[str] = []
+            finish_reason = None
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                event = json.loads(data)
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+            content = "".join(content_parts)
+        else:
+            choice = response.json()["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            content = choice["message"]["content"]
+        if finish_reason == "length":
             raise NvidiaResponseError("NVIDIA response was truncated at the output-token limit")
-        content = choice["message"]["content"]
         return parse_json_object(content)
 
 
@@ -510,7 +542,7 @@ Return:
     result = client.json_completion(
         system,
         user,
-        max_tokens=1400,
+        max_tokens=4096,
         model=client.extraction_model,
         timeout_seconds=client.extraction_timeout,
     )
@@ -572,9 +604,14 @@ Return this shape:
     result = client.json_completion(
         system,
         user,
-        max_tokens=6000,
+        max_tokens=32768,
         model=client.model,
         timeout_seconds=client.synthesis_timeout,
+        temperature=0.2,
+        top_p=0.95,
+        enable_thinking=True,
+        reasoning_budget=8192,
+        stream=True,
     )
     valid_ids = {
         claim["citation"]["document_id"]
