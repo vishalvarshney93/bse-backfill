@@ -1,0 +1,116 @@
+name: FilingForge Research POC
+
+on:
+  workflow_dispatch:
+    inputs:
+      companies:
+        description: "Comma-separated BSE names/symbols"
+        required: true
+        default: "SHILPAMED,MARUTI,HDFCBANK"
+        type: string
+      years:
+        description: "Years of FilingForge history"
+        required: true
+        default: 2
+        type: number
+      run_ai_analysis:
+        description: "Generate cited NVIDIA research snapshots"
+        required: true
+        default: true
+        type: boolean
+      max_analysis_documents:
+        description: "Maximum documents analyzed per company"
+        required: true
+        default: 10
+        type: number
+      max_windows_per_document:
+        description: "Windows sampled across each long document"
+        required: true
+        default: 2
+        type: number
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: filingforge-poc
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 359
+    env:
+      INPUT_COMPANIES: ${{ inputs.companies }}
+      INPUT_YEARS: ${{ inputs.years }}
+      INPUT_RUN_AI: ${{ inputs.run_ai_analysis }}
+      INPUT_MAX_DOCS: ${{ inputs.max_analysis_documents }}
+      INPUT_MAX_WINDOWS: ${{ inputs.max_windows_per_document }}
+      AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
+      NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+      NVIDIA_NIM_MODEL: ${{ vars.NVIDIA_NIM_MODEL }}
+      FILINGFORGE_VERSION: e930f5daef85b6d233fe6b4f63c12086b395cdfd
+
+    steps:
+      - name: Check out POC repository
+        uses: actions/checkout@v4
+
+      - name: Check out pinned FilingForge engine
+        uses: actions/checkout@v4
+        with:
+          repository: nandanpugalia/FilingForge
+          ref: e930f5daef85b6d233fe6b4f63c12086b395cdfd
+          path: vendor/filingforge
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-filingforge-poc.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-filingforge-poc.txt
+          pip install -e vendor/filingforge
+
+      - name: Run offline contract tests
+        run: python test_filingforge_poc.py
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Pull, convert, analyze, and upload
+        shell: bash
+        run: |
+          args=(
+            --companies "$INPUT_COMPANIES"
+            --years "$INPUT_YEARS"
+            --output-root poc-output
+            --max-analysis-documents "$INPUT_MAX_DOCS"
+            --max-windows-per-document "$INPUT_MAX_WINDOWS"
+          )
+          if [[ "$INPUT_RUN_AI" != "true" ]]; then
+            args+=(--skip-analysis)
+          fi
+          python filingforge_poc.py "${args[@]}"
+
+      - name: Write run summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## FilingForge POC" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Companies: $INPUT_COMPANIES" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Years: $INPUT_YEARS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- NVIDIA analysis: $INPUT_RUN_AI" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Storage account: $AZURE_STORAGE_ACCOUNT" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -d poc-output ]]; then
+            find poc-output -name manifest.json -print | sed 's/^/- Manifest: /' >> "$GITHUB_STEP_SUMMARY"
+            find poc-output -name research.json -print | sed 's/^/- Research: /' >> "$GITHUB_STEP_SUMMARY"
+          fi
