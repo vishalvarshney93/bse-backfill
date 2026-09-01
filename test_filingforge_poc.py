@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -126,6 +127,7 @@ class FakeAzureStore:
         self.snapshots = []
         self.analysis_statuses = []
         self.states = []
+        self.verifications = []
 
     def upload_document(self, record, path):
         self.documents.append((record.document_id, path.read_bytes()))
@@ -141,6 +143,17 @@ class FakeAzureStore:
 
     def record_state(self, company_key, status, document_count, detail=""):
         self.states.append((company_key, status, document_count, detail))
+        return True
+
+    def verify_company_upload(self, company_key, records, has_analysis, has_analysis_status):
+        self.verifications.append(
+            (company_key, len(records), has_analysis, has_analysis_status)
+        )
+
+
+class FailingStateAzureStore(FakeAzureStore):
+    def record_state(self, company_key, status, document_count, detail=""):
+        return False
 
 
 class FailingTableClient:
@@ -179,6 +192,91 @@ class FilingForgePocTests(unittest.TestCase):
         self.assertTrue(store.markdown.checked)
         self.assertTrue(store.snapshots.checked)
         self.assertEqual(store.state.query_filter, "PartitionKey eq 'FILINGFORGE_POC'")
+
+    def test_azure_upload_verifier_reads_manifest_markdown_snapshot_and_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            company = Path(temp) / "SHILPA-530549"
+            filing = company / "quarterly" / "2026-06-30_Results.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text(
+                "---\nnews_id: result-123\nextracted: ok\n---\n\nResults text.",
+                encoding="utf-8",
+            )
+            record = build_document_record(company, filing)
+            manifest = json.dumps(build_manifest(record.company_key, [record])).encode("utf-8")
+
+            manifest_blob = mock.Mock()
+            manifest_blob.download_blob.return_value.readall.return_value = manifest
+            markdown_blob = mock.Mock()
+            markdown_blob.download_blob.return_value.readall.return_value = filing.read_bytes()
+            markdown_container = mock.Mock()
+            markdown_container.get_blob_client.side_effect = lambda name: (
+                manifest_blob if name.endswith("manifest.json") else markdown_blob
+            )
+            markdown_container.list_blobs.return_value = []
+            snapshot_container = mock.Mock()
+            snapshot_container.list_blobs.return_value = []
+            state = mock.Mock()
+            state.get_entity.return_value = {
+                "Status": "complete",
+                "DocumentCount": 1,
+                "Detail": "analysis=True",
+            }
+            store = object.__new__(AzureStore)
+            store.markdown = markdown_container
+            store.snapshots = snapshot_container
+            store.state = state
+
+            store.verify_company_upload("SHILPA-530549", [record], True, True)
+
+            snapshot_names = [call.args[0] for call in snapshot_container.get_blob_client.call_args_list]
+            self.assertEqual(
+                snapshot_names,
+                [
+                    "companies/SHILPA-530549/latest.json",
+                    "companies/SHILPA-530549/analysis-status.json",
+                ],
+            )
+            state.get_entity.assert_called_once_with(
+                partition_key="FILINGFORGE_POC",
+                row_key="SHILPA-530549",
+            )
+
+    def test_azure_hydration_restores_markdown_and_filingforge_dedup_ledger(self):
+        with tempfile.TemporaryDirectory() as temp:
+            company = Path(temp) / "SHILPA-530549"
+            markdown = b"---\nnews_id: filing-123\nextracted: ok\n---\n\nVerified filing."
+            digest = hashlib.sha256(markdown).hexdigest()
+            manifest = {
+                "document_count": 1,
+                "documents": [
+                    {
+                        "source_news_id": "filing-123",
+                        "relative_path": "quarterly/2026/2026-06-30_Results.md",
+                        "blob_name": f"companies/SHILPA-530549/documents/quarterly/2026/doc/{digest}.md",
+                        "content_sha256": digest,
+                    }
+                ],
+            }
+            manifest_blob = mock.Mock()
+            manifest_blob.download_blob.return_value.readall.return_value = json.dumps(manifest).encode("utf-8")
+            markdown_blob = mock.Mock()
+            markdown_blob.download_blob.return_value.readall.return_value = markdown
+            store = object.__new__(AzureStore)
+            store.markdown = mock.Mock()
+            store.markdown.get_blob_client.side_effect = [manifest_blob, markdown_blob]
+
+            hydrated = store.hydrate_company_library("SHILPA-530549", company)
+
+            self.assertEqual(hydrated, 1)
+            self.assertEqual(
+                (company / "quarterly" / "2026" / "2026-06-30_Results.md").read_bytes(),
+                markdown,
+            )
+            self.assertEqual(
+                json.loads((company / ".filingforge_index.json").read_text(encoding="utf-8")),
+                ["filing-123"],
+            )
 
     def test_nvidia_preflight_sends_completion_to_each_configured_model(self):
         catalog_response = mock.Mock()
@@ -487,6 +585,40 @@ class FilingForgePocTests(unittest.TestCase):
             self.assertEqual(store.states[0][1:3], ("complete", 1))
             self.assertEqual(store.snapshots, [])
             self.assertEqual(store.analysis_statuses[0][1]["status"], "unavailable")
+            self.assertEqual(
+                store.verifications,
+                [("MARUTI-532500", 1, False, True)],
+            )
+
+    def test_upload_only_fails_when_table_state_cannot_be_persisted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            company = root / "library" / "MARUTI-532500"
+            filing = company / "quarterly" / "2026-06-30_Results.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text(
+                "---\nnews_id: result-123\nextracted: ok\n---\n\nResults text.",
+                encoding="utf-8",
+            )
+            record = build_document_record(company, filing)
+            output = root / "output" / record.company_key
+            output.mkdir(parents=True)
+            (output / "manifest.json").write_text(
+                json.dumps(build_manifest(record.company_key, [record])),
+                encoding="utf-8",
+            )
+            store = FailingStateAzureStore()
+
+            with self.assertRaisesRegex(RuntimeError, "Could not persist Azure Table"):
+                upload_prepared_company(
+                    record.company_key,
+                    [record],
+                    {record.document_id: filing},
+                    root / "output",
+                    store,
+                )
+
+            self.assertEqual(store.verifications, [])
 
 
 if __name__ == "__main__":

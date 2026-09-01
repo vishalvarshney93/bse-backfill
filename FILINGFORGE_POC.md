@@ -57,6 +57,7 @@ az group create --name $resourceGroup --location $location
 
 $app = az ad app create --display-name "ticker-vector-filingforge-actions" | ConvertFrom-Json
 $sp = az ad sp create --id $app.appId | ConvertFrom-Json
+$operatorReaderPrincipalId = az ad signed-in-user show --query id -o tsv
 
 $credential = @{
   name = "bse-backfill-main"
@@ -70,7 +71,8 @@ az ad app federated-credential create --id $app.id --parameters $credential
 az deployment group create `
   --resource-group $resourceGroup `
   --template-file infra/filingforge-poc.bicep `
-  --parameters storageAccountName=$storageAccount githubPrincipalId=$($sp.id)
+  --parameters storageAccountName=$storageAccount githubPrincipalId=$($sp.id) `
+    operatorReaderPrincipalId=$operatorReaderPrincipalId
 ```
 
 The signed-in Azure user running this deployment must be allowed to create role
@@ -131,6 +133,101 @@ research-snapshots/companies/{company-key}/history/{timestamp}.json
 The `latest.json` contract is documented in
 `schemas/company-research.schema.json`.
 
+## Manual Azure verification
+
+Shared-key access is intentionally disabled, so access keys cannot browse this
+account. Use Entra authentication. The following isolated Azure CLI profile
+keeps the personal tenant separate from any Microsoft work-tenant login:
+
+```powershell
+$env:AZURE_CONFIG_DIR = "$HOME\.azure-ticker-vector"
+$tenantId = "47e037bc-bb25-4beb-b44b-62d242f97a2e"
+$subscriptionId = "636c95d0-c24c-4684-8840-d1338ae47708"
+$storageAccount = "filingforgepocstorage"
+
+az login --tenant $tenantId --use-device-code
+az account set --subscription $subscriptionId
+
+$account = az storage account show --name $storageAccount | ConvertFrom-Json
+$resourceGroup = $account.resourceGroup
+$accountId = $account.id
+$operatorObjectId = az ad signed-in-user show --query id -o tsv
+```
+
+For the existing deployment, run these once from an identity allowed to create
+role assignments, then wait up to ten minutes for RBAC propagation:
+
+```powershell
+$filingsScope = "$accountId/blobServices/default/containers/filings-md"
+$researchScope = "$accountId/blobServices/default/containers/research-snapshots"
+$tableScope = "$accountId/tableServices/default/tables/ResearchIngestionState"
+
+az role assignment create --assignee-object-id $operatorObjectId `
+  --assignee-principal-type User --role "Storage Blob Data Reader" --scope $filingsScope
+az role assignment create --assignee-object-id $operatorObjectId `
+  --assignee-principal-type User --role "Storage Blob Data Reader" --scope $researchScope
+az role assignment create --assignee-object-id $operatorObjectId `
+  --assignee-principal-type User --role "Storage Table Data Reader" --scope $tableScope
+```
+
+List and download the uploaded SHILPA artifacts with Entra authentication:
+
+```powershell
+az storage blob list --account-name $storageAccount --container-name filings-md `
+  --auth-mode login --prefix "companies/SHILPA-530549/" `
+  --query "[].{Name:name,Bytes:properties.contentLength}" -o table
+
+az storage blob list --account-name $storageAccount --container-name research-snapshots `
+  --auth-mode login --prefix "companies/SHILPA-530549/" `
+  --query "[].{Name:name,Bytes:properties.contentLength}" -o table
+
+New-Item -ItemType Directory -Force verification | Out-Null
+az storage blob download --account-name $storageAccount --container-name filings-md `
+  --auth-mode login --name "companies/SHILPA-530549/manifest.json" `
+  --file "verification/SHILPA-manifest.json"
+az storage blob download --account-name $storageAccount --container-name research-snapshots `
+  --auth-mode login --name "companies/SHILPA-530549/latest.json" `
+  --file "verification/SHILPA-latest.json"
+
+Get-Content "verification/SHILPA-manifest.json" -Raw | ConvertFrom-Json
+Get-Content "verification/SHILPA-latest.json" -Raw | ConvertFrom-Json
+
+$manifest = Get-Content "verification/SHILPA-manifest.json" -Raw | ConvertFrom-Json
+$document = $manifest.documents[0]
+az storage blob download --account-name $storageAccount --container-name filings-md `
+  --auth-mode login --name $document.blob_name `
+  --file "verification/sample-filing.md"
+$actualHash = (Get-FileHash "verification/sample-filing.md" -Algorithm SHA256).Hash.ToLowerInvariant()
+"Expected: $($document.content_sha256)"
+"Actual:   $actualHash"
+Get-Content "verification/sample-filing.md" -TotalCount 80
+```
+
+Query the ingestion state and confirm the row has `Status=complete`,
+`DocumentCount=27`, and `Detail=analysis=True` for the successful quarter-year
+SHILPA run:
+
+```powershell
+az storage entity query --account-name $storageAccount `
+  --table-name ResearchIngestionState --auth-mode login `
+  --filter "PartitionKey eq 'FILINGFORGE_POC'" `
+  --query "items[].{Company:RowKey,Status:Status,Documents:DocumentCount,Detail:Detail,UpdatedAt:UpdatedAt}" `
+  -o table
+```
+
+The current upload phase also performs read-after-write verification. A green
+workflow must log `verified Azure manifest, ... Markdown hashes, ... table
+state, and zero PDFs`; missing or mismatched data now fails the workflow.
+
+For portal inspection, sign in at `https://portal.azure.com` with the same
+personal-tenant identity, switch directory to tenant
+`47e037bc-bb25-4beb-b44b-62d242f97a2e`, open `filingforgepocstorage`, then use
+**Storage browser**. Blob data is under **Blob containers** > `filings-md` or
+`research-snapshots`; state rows are under **Tables** >
+`ResearchIngestionState`. If the data panes remain blank after role assignment,
+wait for RBAC propagation, sign out/in, and verify the portal directory and
+subscription are the personal ones above.
+
 ## Acceptance checks
 
 - No PDF exists in either Blob container.
@@ -145,11 +242,22 @@ The `latest.json` contract is documented in
 - Future guidance remains `pending`; it is never labeled `missed` early.
 - The same run can be repeated without duplicate Blob paths.
 
+## Incremental ingestion and pilot
+
+- Before each pull, the workflow hydrates manifest-backed Markdown from Azure,
+  verifies every content hash, and restores FilingForge's `news_id` ledger.
+  FilingForge then downloads only unseen filings while the complete accumulated
+  corpus remains available for manifest generation and research analysis.
+- Start the controlled pilot with 5-10 companies over two years. For every
+  company, confirm the workflow logs the hydration count, new/skipped filing
+  counts, `analysis=True` or an explicit availability status, and the final
+  Azure verification line.
+- Manually audit at least five evidence quotes per company against their cited
+  Markdown, every guidance/deliverable classification, and every
+  walk-the-talk status before increasing the company universe.
+
 ## Known POC boundaries
 
-- A fresh GitHub runner makes FilingForge enumerate/download the selected
-  history again. Scaling requires a remote-manifest-aware fetch adapter so
-  already-held filings are skipped before download.
 - FilingForge does not OCR image-only PDFs. The manifest should eventually
   preserve an `extraction_status` for these gaps.
 - The POC analyzes only a bounded document sample. Production analysis will use
@@ -185,9 +293,9 @@ checking Azure. A misconfigured account, expired/invalid OIDC setup, missing
 data-plane role, invalid NVIDIA key, retired model, or failed completion now
 fails before the long download starts.
 
-GitHub-hosted runners are ephemeral, so a failed run's downloaded files are not
-available to a later run. The first retry must download them again. Subsequent
-successful production work will add remote-manifest-aware incremental pulls.
+GitHub-hosted runners are ephemeral, but successful uploads are now hydrated
+from Azure on the next run. Files downloaded by a failed run before its upload
+phase remain unavailable and must be fetched again.
 
 ### `TableClient.query_entities() missing query_filter`
 

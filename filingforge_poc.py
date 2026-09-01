@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import AzureCliCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -289,6 +289,53 @@ class AzureStore:
         )
         log.info("Azure preflight passed for both Blob containers and the state table")
 
+    def hydrate_company_library(self, company_key: str, company_dir: Path) -> int:
+        manifest_name = f"companies/{company_key}/manifest.json"
+        try:
+            manifest = json.loads(
+                self.markdown.get_blob_client(manifest_name).download_blob().readall()
+            )
+        except ResourceNotFoundError:
+            log.info("%s: no remote manifest; starting a new FilingForge library", company_key)
+            return 0
+
+        company_root = company_dir.resolve()
+        hydrated = 0
+        seen_ids: set[str] = set()
+        for document in manifest.get("documents", []):
+            relative_path = str(document.get("relative_path") or "")
+            blob_name = str(document.get("blob_name") or "")
+            expected_hash = str(document.get("content_sha256") or "")
+            if not relative_path or not blob_name or not expected_hash:
+                raise RuntimeError(f"Remote manifest contains an incomplete document for {company_key}")
+            destination = (company_root / Path(relative_path)).resolve()
+            try:
+                destination.relative_to(company_root)
+            except ValueError as exc:
+                raise RuntimeError(f"Unsafe remote manifest path for {company_key}: {relative_path}") from exc
+            markdown = self.markdown.get_blob_client(blob_name).download_blob().readall()
+            if hashlib.sha256(markdown).hexdigest() != expected_hash:
+                raise RuntimeError(f"Remote Markdown hash mismatch for {blob_name}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(markdown)
+            source_news_id = document.get("source_news_id")
+            if source_news_id:
+                seen_ids.add(str(source_news_id))
+            hydrated += 1
+
+        company_root.mkdir(parents=True, exist_ok=True)
+        (company_root / ".filingforge_index.json").write_text(
+            json.dumps(sorted(seen_ids)),
+            encoding="utf-8",
+        )
+        log.info(
+            "%s: hydrated %d verified Markdown documents and %d FilingForge identities from Azure",
+            company_key,
+            hydrated,
+            len(seen_ids),
+        )
+        return hydrated
+
     @staticmethod
     def _upload(container, name: str, data: bytes, content_type: str, overwrite: bool = True) -> None:
         try:
@@ -324,13 +371,16 @@ class AzureStore:
             "application/json",
         )
 
+    @staticmethod
+    def _state_row_key(company_key: str) -> str:
+        return re.sub(r"[/\\#?]", "-", company_key)[:1024]
+
     def record_state(self, company_key: str, status: str, document_count: int, detail: str = "") -> bool:
         try:
-            safe_key = re.sub(r"[/\\#?]", "-", company_key)[:1024]
             self.state.upsert_entity(
                 {
                     "PartitionKey": "FILINGFORGE_POC",
-                    "RowKey": safe_key,
+                    "RowKey": self._state_row_key(company_key),
                     "Status": status,
                     "DocumentCount": document_count,
                     "UpdatedAt": utc_now(),
@@ -342,6 +392,69 @@ class AzureStore:
         except Exception as exc:
             log.warning("Could not record Azure Table state for %s: %s", company_key, exc)
             return False
+
+    def verify_company_upload(
+        self,
+        company_key: str,
+        records: list[DocumentRecord],
+        has_analysis: bool,
+        has_analysis_status: bool,
+    ) -> None:
+        manifest_name = f"companies/{company_key}/manifest.json"
+        remote_manifest = json.loads(
+            self.markdown.get_blob_client(manifest_name).download_blob().readall()
+        )
+        remote_documents = {
+            (document["document_id"], document["content_sha256"])
+            for document in remote_manifest.get("documents", [])
+        }
+        expected_documents = {
+            (record.document_id, record.content_sha256) for record in records
+        }
+        if remote_manifest.get("document_count") != len(records) or remote_documents != expected_documents:
+            raise RuntimeError(f"Azure manifest verification failed for {company_key}")
+
+        for record in records:
+            remote_markdown = self.markdown.get_blob_client(record.blob_name).download_blob().readall()
+            remote_hash = hashlib.sha256(remote_markdown).hexdigest()
+            if len(remote_markdown) != record.byte_length or remote_hash != record.content_sha256:
+                raise RuntimeError(f"Azure Markdown verification failed for {record.document_id}")
+
+        if has_analysis:
+            self.snapshots.get_blob_client(
+                f"companies/{company_key}/latest.json"
+            ).get_blob_properties()
+        if has_analysis_status:
+            self.snapshots.get_blob_client(
+                f"companies/{company_key}/analysis-status.json"
+            ).get_blob_properties()
+
+        for container in (self.markdown, self.snapshots):
+            pdfs = [
+                blob.name
+                for blob in container.list_blobs(name_starts_with=f"companies/{company_key}/")
+                if blob.name.lower().endswith(".pdf")
+            ]
+            if pdfs:
+                raise RuntimeError(f"Unexpected PDF blobs for {company_key}: {', '.join(pdfs[:5])}")
+
+        state = self.state.get_entity(
+            partition_key="FILINGFORGE_POC",
+            row_key=self._state_row_key(company_key),
+        )
+        expected_detail = f"analysis={has_analysis}"
+        if (
+            state.get("Status") != "complete"
+            or int(state.get("DocumentCount", -1)) != len(records)
+            or state.get("Detail") != expected_detail
+        ):
+            raise RuntimeError(f"Azure Table state verification failed for {company_key}: {dict(state)}")
+        log.info(
+            "%s: verified Azure manifest, %d Markdown hashes, analysis=%s, table state, and zero PDFs",
+            company_key,
+            len(records),
+            has_analysis,
+        )
 
 
 class NvidiaClient:
@@ -800,7 +913,14 @@ def upload_prepared_company(
             company_key,
             json.loads(analysis_status_path.read_text(encoding="utf-8")),
         )
-    store.record_state(company_key, "complete", len(company_records), f"analysis={has_analysis}")
+    if not store.record_state(company_key, "complete", len(company_records), f"analysis={has_analysis}"):
+        raise RuntimeError(f"Could not persist Azure Table completion state for {company_key}")
+    store.verify_company_upload(
+        company_key,
+        company_records,
+        has_analysis,
+        analysis_status_path.exists() or has_analysis,
+    )
     log.info("%s: uploaded %d Markdown documents, analysis=%s", company_key, len(company_records), has_analysis)
 
 
@@ -820,6 +940,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-only", action="store_true", help="Pull/analyze locally without Azure")
     parser.add_argument("--upload-only", action="store_true", help="Upload an already prepared library/output")
     parser.add_argument("--preflight", action="store_true", help="Validate Azure and NVIDIA access, then exit")
+    parser.add_argument(
+        "--seed-from-azure",
+        action="store_true",
+        help="Hydrate existing Markdown and FilingForge dedup state from Azure before pulling",
+    )
     parser.add_argument("--max-analysis-documents", type=int, default=10)
     parser.add_argument("--max-chars-per-document", type=int, default=12000)
     parser.add_argument("--max-windows-per-document", type=int, default=2)
@@ -856,8 +981,36 @@ def main() -> int:
     failures: list[str] = []
 
     try:
+        if args.seed_from_azure and not args.upload_only:
+            seed_store = AzureStore()
+            for company in companies:
+                try:
+                    query, expected_scrip_code = parse_company_spec(company)
+                    from engine import BSEClient, resolve
+
+                    client = BSEClient()
+                    try:
+                        candidates = resolve(query, client)
+                    finally:
+                        client.close()
+                    chosen = next(
+                        (candidate for candidate in candidates if str(candidate.scrip_code) == expected_scrip_code),
+                        None,
+                    ) if expected_scrip_code else next(
+                        (candidate for candidate in candidates if candidate.is_primary), candidates[0]
+                    )
+                    if chosen is None:
+                        raise RuntimeError(f"Could not resolve {company!r} for Azure hydration")
+                    company_key = f"{chosen.company.split()[0].upper()}-{chosen.scrip_code}"
+                    seed_store.hydrate_company_library(company_key, library_root / company_key)
+                except Exception:
+                    failures.append(company)
+                    log.exception("Azure hydration failed for %s", company)
+
         if not args.skip_pull and not args.upload_only:
             for company in companies:
+                if company in failures:
+                    continue
                 try:
                     run_filingforge(company, library_root, args.years)
                 except Exception as exc:

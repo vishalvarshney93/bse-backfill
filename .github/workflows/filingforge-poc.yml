@@ -112,6 +112,7 @@ jobs:
             --output-root poc-output
             --max-analysis-documents "$INPUT_MAX_DOCS"
             --max-windows-per-document "$INPUT_MAX_WINDOWS"
+            --seed-from-azure
             --prepare-only
           )
           if [[ "$INPUT_RUN_AI" != "true" ]]; then
