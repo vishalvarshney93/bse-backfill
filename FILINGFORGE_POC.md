@@ -94,7 +94,7 @@ Variables:
   as `nvidia/nemotron-3-ultra-550b-a55b` or
   `nvidia/nemotron-3.5-lightning-30b-a3b`
 - `NVIDIA_NIM_EXTRACTION_MODEL`: optional fast model for per-document evidence
-  extraction; defaults to `nvidia/mistral-nemo-minitron-8b-8k-instruct`
+  extraction; when blank, extraction reuses `NVIDIA_NIM_MODEL`
 
 No Azure client secret or storage key is needed.
 
