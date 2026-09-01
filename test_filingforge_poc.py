@@ -10,6 +10,7 @@ import requests
 
 from filingforge_poc import (
     AzureStore,
+    NvidiaClient,
     build_document_record,
     build_manifest,
     document_windows,
@@ -168,6 +169,35 @@ class FilingForgePocTests(unittest.TestCase):
         self.assertTrue(store.markdown.checked)
         self.assertTrue(store.snapshots.checked)
         self.assertEqual(store.state.query_filter, "PartitionKey eq 'FILINGFORGE_POC'")
+
+    def test_nvidia_preflight_sends_completion_to_each_configured_model(self):
+        catalog_response = mock.Mock()
+        catalog_response.json.return_value = {
+            "data": [
+                {"id": "nvidia/test-extraction"},
+                {"id": "nvidia/test-synthesis"},
+            ]
+        }
+        client = object.__new__(NvidiaClient)
+        client.api_key = "test-key"
+        client.base_url = "https://example.invalid/v1"
+        client.extraction_model = "nvidia/test-extraction"
+        client.model = "nvidia/test-synthesis"
+        client.extraction_timeout = 60
+        client.synthesis_timeout = 180
+        client.session = mock.Mock()
+        client.session.get.return_value = catalog_response
+        client.json_completion = mock.Mock(return_value={"ok": True})
+
+        client.preflight()
+
+        self.assertEqual(client.json_completion.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["model"] for call in client.json_completion.call_args_list],
+            ["nvidia/test-extraction", "nvidia/test-synthesis"],
+        )
+        self.assertTrue(all(call.kwargs["max_tokens"] == 32 for call in client.json_completion.call_args_list))
+        self.assertTrue(all(call.kwargs["timeout_seconds"] == 30 for call in client.json_completion.call_args_list))
 
     def test_nvidia_model_id_requires_publisher_prefix(self):
         self.assertEqual(
