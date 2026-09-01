@@ -3,7 +3,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
+
+import requests
 
 from filingforge_poc import (
     AzureStore,
@@ -13,6 +16,8 @@ from filingforge_poc import (
     extract_supported_claims,
     parse_json_object,
     parse_company_spec,
+    parse_args,
+    process_company,
     select_research_documents,
     synthesize_company_research,
     upload_prepared_company,
@@ -24,8 +29,12 @@ from filingforge_poc import (
 class FakeNvidiaClient:
     def __init__(self):
         self.calls = 0
+        self.model = "nvidia/test-synthesis"
+        self.extraction_model = "nvidia/test-extraction"
+        self.extraction_timeout = 1
+        self.synthesis_timeout = 1
 
-    def json_completion(self, system, user, max_tokens=6000):
+    def json_completion(self, system, user, max_tokens=6000, model=None, timeout_seconds=None):
         self.calls += 1
         if self.calls == 1:
             return {
@@ -89,11 +98,22 @@ class FakeNvidiaClient:
         }
 
 
+class TimingOutNvidiaClient:
+    model = "nvidia/test-synthesis"
+    extraction_model = "nvidia/test-extraction"
+    extraction_timeout = 1
+    synthesis_timeout = 1
+
+    def json_completion(self, *args, **kwargs):
+        raise requests.ReadTimeout("simulated NVIDIA timeout")
+
+
 class FakeAzureStore:
     def __init__(self):
         self.documents = []
         self.manifests = []
         self.snapshots = []
+        self.analysis_statuses = []
         self.states = []
 
     def upload_document(self, record, path):
@@ -104,6 +124,9 @@ class FakeAzureStore:
 
     def upload_snapshot(self, company_key, snapshot):
         self.snapshots.append((company_key, snapshot))
+
+    def upload_analysis_status(self, company_key, status):
+        self.analysis_statuses.append((company_key, status))
 
     def record_state(self, company_key, status, document_count, detail=""):
         self.states.append((company_key, status, document_count, detail))
@@ -132,6 +155,10 @@ class FakeReadableTableClient:
 
 
 class FilingForgePocTests(unittest.TestCase):
+    def test_cli_accepts_six_month_window(self):
+        with mock.patch.object(sys, "argv", ["filingforge_poc.py", "--years", "0.5"]):
+            self.assertEqual(parse_args().years, 0.5)
+
     def test_azure_preflight_checks_both_containers_and_table(self):
         store = object.__new__(AzureStore)
         store.markdown = FakeContainerClient()
@@ -154,6 +181,39 @@ class FilingForgePocTests(unittest.TestCase):
         store = object.__new__(AzureStore)
         store.state = FailingTableClient()
         self.assertFalse(store.record_state("MARUTI-532500", "complete", 1))
+
+    def test_nvidia_timeouts_preserve_manifest_and_mark_analysis_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            company = root / "library" / "MARUTI-532500"
+            filing = company / "concalls" / "2026-06-30_Earnings_Call.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text(
+                "---\nnews_id: call-123\nsource_pdf: source.pdf\nextracted: ok\n---\n\n"
+                + ("Management expects capacity to double during FY27. " * 600),
+                encoding="utf-8",
+            )
+            record = build_document_record(company, filing)
+            output_root = root / "output"
+
+            process_company(
+                record.company_key,
+                [record],
+                {record.document_id: filing},
+                output_root,
+                None,
+                TimingOutNvidiaClient(),
+                10,
+                12_000,
+                2,
+            )
+
+            company_output = output_root / record.company_key
+            self.assertTrue((company_output / "manifest.json").exists())
+            self.assertTrue((company_output / "analysis-status.json").exists())
+            self.assertFalse((company_output / "research.json").exists())
+            status = json.loads((company_output / "analysis-status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["failed_windows"], 2)
 
     def test_company_specs_can_pin_ambiguous_names_to_bse_scrip_code(self):
         self.assertEqual(parse_company_spec("Maruti Suzuki India|532500"), ("Maruti Suzuki India", "532500"))
@@ -194,8 +254,8 @@ class FilingForgePocTests(unittest.TestCase):
             original_id = record.document_id
             client_result = client.json_completion
 
-            def synthesis_with_real_id(system, user, max_tokens=6000):
-                result = client_result(system, user, max_tokens)
+            def synthesis_with_real_id(system, user, max_tokens=6000, **kwargs):
+                result = client_result(system, user, max_tokens, **kwargs)
                 for collection in ("management_guidance", "key_deliverables"):
                     for item in result.get(collection, []):
                         item["document_ids"] = [original_id]
@@ -278,6 +338,10 @@ class FilingForgePocTests(unittest.TestCase):
             output.mkdir(parents=True)
             manifest = build_manifest(record.company_key, [record])
             (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (output / "analysis-status.json").write_text(
+                json.dumps({"status": "unavailable", "details": ["simulated timeout"]}),
+                encoding="utf-8",
+            )
 
             store = FakeAzureStore()
             upload_prepared_company(
@@ -292,6 +356,7 @@ class FilingForgePocTests(unittest.TestCase):
             self.assertEqual(store.manifests[0][0], "MARUTI-532500")
             self.assertEqual(store.states[0][1:3], ("complete", 1))
             self.assertEqual(store.snapshots, [])
+            self.assertEqual(store.analysis_statuses[0][1]["status"], "unavailable")
 
 
 if __name__ == "__main__":
