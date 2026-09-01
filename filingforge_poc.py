@@ -181,7 +181,7 @@ def parse_company_spec(company_spec: str) -> tuple[str, str | None]:
     return query, scrip_code or None
 
 
-def run_filingforge(company_spec: str, library_root: Path, years: int) -> str:
+def run_filingforge(company_spec: str, library_root: Path, years: float) -> str:
     from engine import BSEClient, build_library, resolve
 
     query, expected_scrip_code = parse_company_spec(company_spec)
@@ -199,7 +199,7 @@ def run_filingforge(company_spec: str, library_root: Path, years: int) -> str:
                 f"Candidates: {available or 'none'}"
             )
         ticker = f"{chosen.company.split()[0].upper()}-{chosen.scrip_code}"
-        log.info("Pulling %s (%s) with FilingForge (%d years)", chosen.company, chosen.scrip_code, years)
+        log.info("Pulling %s (%s) with FilingForge (%g years)", chosen.company, chosen.scrip_code, years)
         result = build_library(
             chosen.scrip_code,
             ticker,
@@ -295,6 +295,15 @@ class AzureStore:
         version = snapshot["generated_at"].replace(":", "-")
         self._upload(self.snapshots, f"companies/{company_key}/history/{version}.json", payload, "application/json")
 
+    def upload_analysis_status(self, company_key: str, status: dict[str, Any]) -> None:
+        payload = json.dumps(status, ensure_ascii=False, indent=2).encode("utf-8")
+        self._upload(
+            self.snapshots,
+            f"companies/{company_key}/analysis-status.json",
+            payload,
+            "application/json",
+        )
+
     def record_state(self, company_key: str, status: str, document_count: int, detail: str = "") -> bool:
         try:
             safe_key = re.sub(r"[/\\#?]", "-", company_key)[:1024]
@@ -322,9 +331,15 @@ class NvidiaClient:
             os.environ.get("NVIDIA_NIM_MODEL") or "nvidia/nvidia-nemotron-nano-9b-v2"
         ).strip()
         validate_nvidia_model_id(self.model)
+        self.extraction_model = (
+            os.environ.get("NVIDIA_NIM_EXTRACTION_MODEL") or "nvidia/nvidia-nemotron-nano-9b-v2"
+        ).strip()
+        validate_nvidia_model_id(self.extraction_model)
         self.base_url = os.environ.get(
             "NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1"
         ).rstrip("/")
+        self.extraction_timeout = float(os.environ.get("NVIDIA_NIM_EXTRACTION_TIMEOUT_SECONDS", "60"))
+        self.synthesis_timeout = float(os.environ.get("NVIDIA_NIM_SYNTHESIS_TIMEOUT_SECONDS", "180"))
         if not self.api_key:
             raise RuntimeError("NVIDIA_NIM_API_KEY is required unless --skip-analysis is used")
         self.session = requests.Session()
@@ -341,27 +356,43 @@ class NvidiaClient:
             for model in response.json().get("data", [])
             if isinstance(model, dict) and model.get("id")
         }
-        if available_models and self.model not in available_models:
-            raise RuntimeError(f"NVIDIA model {self.model!r} is not available to this API key")
-        log.info("NVIDIA preflight passed for model %s", self.model)
+        unavailable = [
+            model for model in {self.model, self.extraction_model}
+            if available_models and model not in available_models
+        ]
+        if unavailable:
+            raise RuntimeError(f"NVIDIA model(s) not available to this API key: {', '.join(sorted(unavailable))}")
+        log.info(
+            "NVIDIA preflight passed for synthesis=%s, extraction=%s",
+            self.model,
+            self.extraction_model,
+        )
 
     @retry(
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=2, min=2, max=20),
         retry=retry_if_exception_type((requests.RequestException, NvidiaResponseError)),
         reraise=True,
     )
-    def json_completion(self, system: str, user: str, max_tokens: int = 6000) -> dict[str, Any]:
+    def json_completion(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 2000,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         response = self.session.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json={
-                "model": self.model,
+                "model": model or self.model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "temperature": 0.1,
                 "max_tokens": max_tokens,
+                "chat_template_kwargs": {"enable_thinking": False},
             },
-            timeout=180,
+            timeout=timeout_seconds or self.synthesis_timeout,
         )
         response.raise_for_status()
         choice = response.json()["choices"][0]
@@ -434,7 +465,13 @@ SOURCE:
 Return:
 {{"claims":[{{"claim_type":"guidance","statement":"...","metric":null,"target":null,
 "target_period":null,"quote":"exact source text","heading":null}}]}}"""
-    result = client.json_completion(system, user)
+    result = client.json_completion(
+        system,
+        user,
+        max_tokens=1400,
+        model=client.extraction_model,
+        timeout_seconds=client.extraction_timeout,
+    )
     supported: list[dict[str, Any]] = []
     normalized_source = normalize_text(source)
     for claim in result.get("claims", []):
@@ -490,7 +527,13 @@ Return this shape:
   "walk_the_talk": [{{"guidance_id":"G1", "status":"achieved|partially_achieved|missed|pending|unverifiable",
     "assessment":"", "guidance_document_ids":[], "outcome_document_ids":[]}}]
 }}"""
-    result = client.json_completion(system, user, max_tokens=12000)
+    result = client.json_completion(
+        system,
+        user,
+        max_tokens=6000,
+        model=client.model,
+        timeout_seconds=client.synthesis_timeout,
+    )
     valid_ids = {
         claim["citation"]["document_id"]
         for claim in claims
@@ -563,31 +606,74 @@ def process_company(
     snapshot: dict[str, Any] | None = None
     if nvidia:
         claims: list[dict[str, Any]] = []
+        failed_windows = 0
+        failure_messages: list[str] = []
         selected = select_research_documents(company_records, max_analysis_documents)
         for record in selected:
             markdown = paths[record.document_id].read_text(encoding="utf-8", errors="replace")
             for source_offset, source in document_windows(
                 markdown, max_chars_per_document, max_windows_per_document
             ):
-                claims.extend(extract_supported_claims(nvidia, record, source, source_offset))
-        if not claims:
-            raise NvidiaResponseError(f"No validated evidence was extracted for {company_key}")
-        research = synthesize_company_research(nvidia, company_key, claims)
-        snapshot = {
-            "schema_version": 1,
-            "company_key": company_key,
-            "generated_at": utc_now(),
-            "source_document_count": len(selected),
-            "validated_evidence_count": len(claims),
-            "research": research,
-            "evidence": claims,
-        }
-        validate_snapshot(snapshot)
-        (company_output / "research.json").write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        if store:
-            store.upload_snapshot(company_key, snapshot)
+                try:
+                    claims.extend(extract_supported_claims(nvidia, record, source, source_offset))
+                except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
+                    failed_windows += 1
+                    failure_messages.append(f"{record.document_id}@{source_offset}: {type(exc).__name__}")
+                    log.warning(
+                        "%s: skipping timed-out/invalid NVIDIA window %s@%d: %s",
+                        company_key,
+                        record.document_id,
+                        source_offset,
+                        exc,
+                    )
+                    if failed_windows >= 2:
+                        log.warning("%s: stopping NVIDIA extraction after %d failed windows", company_key, failed_windows)
+                        break
+            if failed_windows >= 2:
+                break
+
+        if claims:
+            try:
+                research = synthesize_company_research(nvidia, company_key, claims)
+                snapshot = {
+                    "schema_version": 1,
+                    "company_key": company_key,
+                    "generated_at": utc_now(),
+                    "source_document_count": len(selected),
+                    "validated_evidence_count": len(claims),
+                    "research": research,
+                    "evidence": claims,
+                }
+                validate_snapshot(snapshot)
+                (company_output / "research.json").write_text(
+                    json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                if store:
+                    store.upload_snapshot(company_key, snapshot)
+            except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
+                failure_messages.append(f"synthesis: {type(exc).__name__}")
+                log.warning("%s: NVIDIA synthesis unavailable; Markdown will still upload: %s", company_key, exc)
+        else:
+            failure_messages.append("no validated evidence extracted")
+
+        if snapshot is None:
+            analysis_status = {
+                "status": "unavailable",
+                "generated_at": utc_now(),
+                "failed_windows": failed_windows,
+                "details": failure_messages,
+            }
+            (company_output / "analysis-status.json").write_text(
+                json.dumps(analysis_status, indent=2),
+                encoding="utf-8",
+            )
+            if store:
+                store.upload_analysis_status(company_key, analysis_status)
+        elif store:
+            store.upload_analysis_status(
+                company_key,
+                {"status": "available", "generated_at": snapshot["generated_at"]},
+            )
 
     if store:
         store.record_state(company_key, "complete", len(company_records), f"analysis={bool(snapshot)}")
@@ -620,11 +706,21 @@ def upload_prepared_company(
     store.upload_manifest(company_key, manifest)
 
     research_path = company_output / "research.json"
+    analysis_status_path = company_output / "analysis-status.json"
     has_analysis = research_path.exists()
     if has_analysis:
         snapshot = json.loads(research_path.read_text(encoding="utf-8"))
         validate_snapshot(snapshot)
         store.upload_snapshot(company_key, snapshot)
+        store.upload_analysis_status(
+            company_key,
+            {"status": "available", "generated_at": snapshot["generated_at"]},
+        )
+    elif analysis_status_path.exists():
+        store.upload_analysis_status(
+            company_key,
+            json.loads(analysis_status_path.read_text(encoding="utf-8")),
+        )
     store.record_state(company_key, "complete", len(company_records), f"analysis={has_analysis}")
     log.info("%s: uploaded %d Markdown documents, analysis=%s", company_key, len(company_records), has_analysis)
 
@@ -636,7 +732,7 @@ def parse_args() -> argparse.Namespace:
         default="SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180",
         help="Comma-separated names, optionally pinned as name|BSE-scrip-code",
     )
-    parser.add_argument("--years", type=int, default=2)
+    parser.add_argument("--years", type=float, default=2.0)
     parser.add_argument("--library-root")
     parser.add_argument("--output-root", default="poc-output")
     parser.add_argument("--skip-pull", action="store_true")
@@ -646,7 +742,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-only", action="store_true", help="Upload an already prepared library/output")
     parser.add_argument("--preflight", action="store_true", help="Validate Azure and NVIDIA access, then exit")
     parser.add_argument("--max-analysis-documents", type=int, default=10)
-    parser.add_argument("--max-chars-per-document", type=int, default=30000)
+    parser.add_argument("--max-chars-per-document", type=int, default=12000)
     parser.add_argument("--max-windows-per-document", type=int, default=2)
     return parser.parse_args()
 
