@@ -28,7 +28,7 @@ from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import AzureCliCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from jsonschema import Draft202012Validator, FormatChecker
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -106,6 +106,26 @@ def parse_json_object(value: str) -> dict[str, Any]:
 
 class NvidiaResponseError(RuntimeError):
     pass
+
+
+class NvidiaRequestError(NvidiaResponseError):
+    def __init__(self, model: str, status_code: int) -> None:
+        self.status_code = status_code
+        if status_code in {401, 403}:
+            guidance = "verify NVIDIA_NIM_API_KEY has hosted-inference access"
+        elif status_code == 404:
+            guidance = "verify the model supports hosted chat completions"
+        else:
+            guidance = "check the NVIDIA API status and model configuration"
+        super().__init__(
+            f"NVIDIA model {model!r} returned HTTP {status_code} from /chat/completions; {guidance}"
+        )
+
+
+def is_retryable_nvidia_error(exc: BaseException) -> bool:
+    if isinstance(exc, NvidiaRequestError):
+        return exc.status_code in {408, 429} or exc.status_code >= 500
+    return isinstance(exc, (requests.RequestException, NvidiaResponseError))
 
 
 def validate_nvidia_model_id(model: str) -> str:
@@ -332,7 +352,7 @@ class NvidiaClient:
         ).strip()
         validate_nvidia_model_id(self.model)
         self.extraction_model = (
-            os.environ.get("NVIDIA_NIM_EXTRACTION_MODEL") or "nvidia/mistral-nemo-minitron-8b-8k-instruct"
+            os.environ.get("NVIDIA_NIM_EXTRACTION_MODEL") or self.model
         ).strip()
         validate_nvidia_model_id(self.extraction_model)
         self.base_url = os.environ.get(
@@ -389,7 +409,7 @@ class NvidiaClient:
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=2, min=2, max=20),
-        retry=retry_if_exception_type((requests.RequestException, NvidiaResponseError)),
+        retry=retry_if_exception(is_retryable_nvidia_error),
         reraise=True,
     )
     def json_completion(
@@ -400,11 +420,12 @@ class NvidiaClient:
         model: str | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
+        requested_model = model or self.model
         response = self.session.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             json={
-                "model": model or self.model,
+                "model": requested_model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "temperature": 0.1,
                 "max_tokens": max_tokens,
@@ -412,7 +433,10 @@ class NvidiaClient:
             },
             timeout=timeout_seconds or self.synthesis_timeout,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise NvidiaRequestError(requested_model, response.status_code) from exc
         choice = response.json()["choices"][0]
         if choice.get("finish_reason") == "length":
             raise NvidiaResponseError("NVIDIA response was truncated at the output-token limit")
