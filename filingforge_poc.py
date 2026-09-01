@@ -108,6 +108,17 @@ class NvidiaResponseError(RuntimeError):
     pass
 
 
+def validate_nvidia_model_id(model: str) -> str:
+    model = str(model or "").strip()
+    if "/" not in model:
+        suffix = model[len("nvidia"):] if model.lower().startswith("nvidia") else model
+        suggestion = f"nvidia/{suffix.lstrip('/-')}"
+        raise ValueError(
+            f"NVIDIA_NIM_MODEL must include its publisher prefix, for example {suggestion!r}; got {model!r}"
+        )
+    return model
+
+
 def build_document_record(company_dir: Path, markdown_path: Path) -> DocumentRecord:
     relative = markdown_path.relative_to(company_dir).as_posix()
     parts = Path(relative).parts
@@ -249,7 +260,13 @@ class AzureStore:
     def preflight(self) -> None:
         self.markdown.get_container_properties()
         self.snapshots.get_container_properties()
-        next(self.state.query_entities(results_per_page=1), None)
+        next(
+            self.state.query_entities(
+                "PartitionKey eq 'FILINGFORGE_POC'",
+                results_per_page=1,
+            ),
+            None,
+        )
         log.info("Azure preflight passed for both Blob containers and the state table")
 
     @staticmethod
@@ -304,6 +321,7 @@ class NvidiaClient:
         self.model = (
             os.environ.get("NVIDIA_NIM_MODEL") or "nvidia/nvidia-nemotron-nano-9b-v2"
         ).strip()
+        validate_nvidia_model_id(self.model)
         self.base_url = os.environ.get(
             "NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1"
         ).rstrip("/")
