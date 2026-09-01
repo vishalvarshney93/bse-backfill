@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -26,7 +25,7 @@ from typing import Any
 import requests
 from azure.core.exceptions import ResourceExistsError
 from azure.data.tables import TableServiceClient, UpdateMode
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from jsonschema import Draft202012Validator, FormatChecker
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -162,10 +161,54 @@ def discover_documents(library_root: Path) -> tuple[list[DocumentRecord], dict[s
     return records, paths
 
 
-def run_filingforge(company: str, library_root: Path, years: int) -> None:
-    command = [sys.executable, "-m", "engine", company, str(library_root), "--years", str(years)]
-    log.info("Pulling %s with FilingForge (%d years)", company, years)
-    subprocess.run(command, check=True)
+def parse_company_spec(company_spec: str) -> tuple[str, str | None]:
+    query, separator, scrip_code = company_spec.partition("|")
+    query = query.strip()
+    scrip_code = scrip_code.strip() if separator else None
+    if not query:
+        raise ValueError(f"Invalid company specification: {company_spec!r}")
+    return query, scrip_code or None
+
+
+def run_filingforge(company_spec: str, library_root: Path, years: int) -> str:
+    from engine import BSEClient, build_library, resolve
+
+    query, expected_scrip_code = parse_company_spec(company_spec)
+    client = BSEClient()
+    try:
+        candidates = resolve(query, client)
+        chosen = next(
+            (candidate for candidate in candidates if str(candidate.scrip_code) == expected_scrip_code),
+            None,
+        ) if expected_scrip_code else next((candidate for candidate in candidates if candidate.is_primary), candidates[0])
+        if chosen is None:
+            available = ", ".join(f"{candidate.company} ({candidate.scrip_code})" for candidate in candidates[:10])
+            raise RuntimeError(
+                f"{query!r} did not resolve to requested BSE scrip code {expected_scrip_code}. "
+                f"Candidates: {available or 'none'}"
+            )
+        ticker = f"{chosen.company.split()[0].upper()}-{chosen.scrip_code}"
+        log.info("Pulling %s (%s) with FilingForge (%d years)", chosen.company, chosen.scrip_code, years)
+        result = build_library(
+            chosen.scrip_code,
+            ticker,
+            library_root,
+            [],
+            years,
+            client,
+            everything=True,
+        )
+        log.info(
+            "%s: %d new, %d already present, %d failed, %d pending",
+            ticker,
+            len(result.downloaded),
+            len(result.skipped),
+            len(result.failed),
+            len(result.pending),
+        )
+        return ticker
+    finally:
+        client.close()
 
 
 def remove_temporary_pdfs(library_root: Path) -> int:
@@ -184,7 +227,7 @@ class AzureStore:
             self.blobs = BlobServiceClient.from_connection_string(connection_string)
             self.tables = TableServiceClient.from_connection_string(connection_string)
         elif account_name:
-            credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
+            credential = AzureCliCredential(process_timeout=30)
             self.blobs = BlobServiceClient(
                 account_url=f"https://{account_name}.blob.core.windows.net", credential=credential
             )
@@ -202,6 +245,12 @@ class AzureStore:
         )
         table_name = os.environ.get("RESEARCH_STATE_TABLE", "ResearchIngestionState")
         self.state = self.tables.get_table_client(table_name)
+
+    def preflight(self) -> None:
+        self.markdown.get_container_properties()
+        self.snapshots.get_container_properties()
+        next(self.state.query_entities(results_per_page=1), None)
+        log.info("Azure preflight passed for both Blob containers and the state table")
 
     @staticmethod
     def _upload(container, name: str, data: bytes, content_type: str, overwrite: bool = True) -> None:
@@ -229,19 +278,24 @@ class AzureStore:
         version = snapshot["generated_at"].replace(":", "-")
         self._upload(self.snapshots, f"companies/{company_key}/history/{version}.json", payload, "application/json")
 
-    def record_state(self, company_key: str, status: str, document_count: int, detail: str = "") -> None:
-        safe_key = re.sub(r"[/\\#?]", "-", company_key)[:1024]
-        self.state.upsert_entity(
-            {
-                "PartitionKey": "FILINGFORGE_POC",
-                "RowKey": safe_key,
-                "Status": status,
-                "DocumentCount": document_count,
-                "UpdatedAt": utc_now(),
-                "Detail": detail[:1000],
-            },
-            mode=UpdateMode.MERGE,
-        )
+    def record_state(self, company_key: str, status: str, document_count: int, detail: str = "") -> bool:
+        try:
+            safe_key = re.sub(r"[/\\#?]", "-", company_key)[:1024]
+            self.state.upsert_entity(
+                {
+                    "PartitionKey": "FILINGFORGE_POC",
+                    "RowKey": safe_key,
+                    "Status": status,
+                    "DocumentCount": document_count,
+                    "UpdatedAt": utc_now(),
+                    "Detail": detail[:1000],
+                },
+                mode=UpdateMode.MERGE,
+            )
+            return True
+        except Exception as exc:
+            log.warning("Could not record Azure Table state for %s: %s", company_key, exc)
+            return False
 
 
 class NvidiaClient:
@@ -256,6 +310,22 @@ class NvidiaClient:
         if not self.api_key:
             raise RuntimeError("NVIDIA_NIM_API_KEY is required unless --skip-analysis is used")
         self.session = requests.Session()
+
+    def preflight(self) -> None:
+        response = self.session.get(
+            f"{self.base_url}/models",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        available_models = {
+            str(model.get("id"))
+            for model in response.json().get("data", [])
+            if isinstance(model, dict) and model.get("id")
+        }
+        if available_models and self.model not in available_models:
+            raise RuntimeError(f"NVIDIA model {self.model!r} is not available to this API key")
+        log.info("NVIDIA preflight passed for model %s", self.model)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -506,15 +576,57 @@ def process_company(
     log.info("%s: %d Markdown documents, analysis=%s", company_key, len(company_records), bool(snapshot))
 
 
+def upload_prepared_company(
+    company_key: str,
+    records: list[DocumentRecord],
+    paths: dict[str, Path],
+    output_root: Path,
+    store: AzureStore,
+) -> None:
+    company_records = [record for record in records if record.company_key == company_key]
+    company_output = output_root / company_key
+    manifest_path = company_output / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError(f"Prepared manifest is missing for {company_key}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prepared = {
+        (document["document_id"], document["content_sha256"])
+        for document in manifest.get("documents", [])
+    }
+    discovered = {(record.document_id, record.content_sha256) for record in company_records}
+    if prepared != discovered:
+        raise RuntimeError(f"Prepared manifest does not match current Markdown library for {company_key}")
+
+    for record in company_records:
+        store.upload_document(record, paths[record.document_id])
+    store.upload_manifest(company_key, manifest)
+
+    research_path = company_output / "research.json"
+    has_analysis = research_path.exists()
+    if has_analysis:
+        snapshot = json.loads(research_path.read_text(encoding="utf-8"))
+        validate_snapshot(snapshot)
+        store.upload_snapshot(company_key, snapshot)
+    store.record_state(company_key, "complete", len(company_records), f"analysis={has_analysis}")
+    log.info("%s: uploaded %d Markdown documents, analysis=%s", company_key, len(company_records), has_analysis)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--companies", default="SHILPAMED,MARUTI,HDFCBANK")
+    parser.add_argument(
+        "--companies",
+        default="SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180",
+        help="Comma-separated names, optionally pinned as name|BSE-scrip-code",
+    )
     parser.add_argument("--years", type=int, default=2)
     parser.add_argument("--library-root")
     parser.add_argument("--output-root", default="poc-output")
     parser.add_argument("--skip-pull", action="store_true")
     parser.add_argument("--skip-analysis", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Write local outputs without Azure")
+    parser.add_argument("--prepare-only", action="store_true", help="Pull/analyze locally without Azure")
+    parser.add_argument("--upload-only", action="store_true", help="Upload an already prepared library/output")
+    parser.add_argument("--preflight", action="store_true", help="Validate Azure and NVIDIA access, then exit")
     parser.add_argument("--max-analysis-documents", type=int, default=10)
     parser.add_argument("--max-chars-per-document", type=int, default=30000)
     parser.add_argument("--max-windows-per-document", type=int, default=2)
@@ -523,6 +635,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.preflight:
+        AzureStore().preflight()
+        if not args.skip_analysis:
+            NvidiaClient().preflight()
+        return 0
+    if args.prepare_only and args.upload_only:
+        raise SystemExit("--prepare-only and --upload-only cannot be combined")
+    if args.upload_only and not args.library_root:
+        raise SystemExit("--upload-only requires --library-root")
     companies = [company.strip() for company in args.companies.split(",") if company.strip()]
     if not companies:
         raise SystemExit("--companies must contain at least one company")
@@ -537,16 +658,16 @@ def main() -> int:
 
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    store = None if args.dry_run else AzureStore()
-    nvidia = None if args.skip_analysis else NvidiaClient()
+    store = AzureStore() if args.upload_only or (not args.dry_run and not args.prepare_only) else None
+    nvidia = None if args.skip_analysis or args.upload_only else NvidiaClient()
     failures: list[str] = []
 
     try:
-        if not args.skip_pull:
+        if not args.skip_pull and not args.upload_only:
             for company in companies:
                 try:
                     run_filingforge(company, library_root, args.years)
-                except subprocess.CalledProcessError as exc:
+                except Exception as exc:
                     failures.append(company)
                     log.exception("FilingForge pull failed for %s; continuing with other companies", company)
                     if store:
@@ -559,17 +680,20 @@ def main() -> int:
 
         for company_key in company_keys:
             try:
-                process_company(
-                    company_key,
-                    records,
-                    paths,
-                    output_root,
-                    store,
-                    nvidia,
-                    args.max_analysis_documents,
-                    args.max_chars_per_document,
-                    args.max_windows_per_document,
-                )
+                if args.upload_only:
+                    upload_prepared_company(company_key, records, paths, output_root, store)
+                else:
+                    process_company(
+                        company_key,
+                        records,
+                        paths,
+                        output_root,
+                        store,
+                        nvidia,
+                        args.max_analysis_documents,
+                        args.max_chars_per_document,
+                        args.max_windows_per_document,
+                    )
             except Exception as exc:
                 failures.append(company_key)
                 log.exception("Processing failed for %s; continuing with other companies", company_key)
