@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       companies:
-        description: "Comma-separated BSE names/symbols"
+        description: "Comma-separated name|BSE-scrip-code values"
         required: true
-        default: "SHILPAMED,MARUTI,HDFCBANK"
+        default: "SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180"
         type: string
       years:
         description: "Years of FilingForge history"
@@ -79,27 +79,72 @@ jobs:
       - name: Run offline contract tests
         run: python test_filingforge_poc.py
 
-      - name: Sign in to Azure with GitHub OIDC
-        uses: azure/login@v2
+      - name: Sign in to Azure for preflight
+        id: azure-preflight-login
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Pull, convert, analyze, and upload
+      - name: Prime Azure Storage token for preflight
+        run: az account get-access-token --resource https://storage.azure.com/ --output none
+
+      - name: Validate Azure data plane and NVIDIA model
+        shell: bash
+        run: |
+          args=(--preflight)
+          if [[ "$INPUT_RUN_AI" != "true" ]]; then
+            args+=(--skip-analysis)
+          fi
+          python filingforge_poc.py "${args[@]}"
+
+      - name: Pull, convert, and analyze locally
+        id: prepare
+        continue-on-error: true
         shell: bash
         run: |
           args=(
             --companies "$INPUT_COMPANIES"
             --years "$INPUT_YEARS"
+            --library-root FilingForgeLibrary
             --output-root poc-output
             --max-analysis-documents "$INPUT_MAX_DOCS"
             --max-windows-per-document "$INPUT_MAX_WINDOWS"
+            --prepare-only
           )
           if [[ "$INPUT_RUN_AI" != "true" ]]; then
             args+=(--skip-analysis)
           fi
           python filingforge_poc.py "${args[@]}"
+
+      - name: Sign in to Azure with fresh GitHub OIDC token
+        if: ${{ always() && steps.prepare.outcome != 'skipped' }}
+        id: azure-login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prime Azure Storage access token
+        if: ${{ always() && steps.azure-login.outcome == 'success' }}
+        run: az account get-access-token --resource https://storage.azure.com/ --output none
+
+      - name: Upload prepared Markdown and research
+        if: ${{ always() && steps.azure-login.outcome == 'success' }}
+        run: >-
+          python filingforge_poc.py
+          --companies "$INPUT_COMPANIES"
+          --library-root FilingForgeLibrary
+          --output-root poc-output
+          --upload-only
+
+      - name: Fail after preserving partial preparation output
+        if: ${{ always() && steps.prepare.outcome == 'failure' }}
+        run: |
+          echo "One or more companies failed during preparation; successfully prepared outputs were still uploaded."
+          exit 1
 
       - name: Write run summary
         if: always()
