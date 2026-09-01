@@ -93,6 +93,8 @@ Variables:
 - `NVIDIA_NIM_MODEL`: the full publisher/model identifier, including `/`, such
   as `nvidia/nemotron-3-ultra-550b-a55b` or
   `nvidia/nemotron-3.5-lightning-30b-a3b`
+- `NVIDIA_NIM_EXTRACTION_MODEL`: optional fast model for per-document evidence
+  extraction; recommended `nvidia/nvidia-nemotron-nano-9b-v2`
 
 No Azure client secret or storage key is needed.
 
@@ -155,6 +157,10 @@ The `latest.json` contract is documented in
 - NVIDIA API Catalog is a trial endpoint, not a production SLA. Ingestion must
   still succeed when analysis is disabled; query-time Research AI will use
   lexical fallback if NVIDIA reranking is unavailable.
+- NVIDIA extraction uses 12,000-character windows, a 1,400-token response cap,
+  reasoning disabled, two attempts, and a 60-second timeout. After two failed
+  windows the company is marked analysis-unavailable, but its Markdown and
+  manifest still upload successfully.
 - Financial statements, shareholding, corporate actions, and fundamental
   screening require deterministic XBRL/feed ingestion into Azure SQL. LLM
   extraction is evidence for narrative research, not the numeric source of
