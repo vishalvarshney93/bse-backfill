@@ -9,7 +9,7 @@ on:
         default: "SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180"
         type: string
       years:
-        description: "Years of FilingForge history"
+        description: "Years of FilingForge history (0.5 = six months)"
         required: true
         default: 2
         type: number
@@ -50,6 +50,7 @@ jobs:
       AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
       NVIDIA_NIM_MODEL: ${{ vars.NVIDIA_NIM_MODEL }}
+      NVIDIA_NIM_EXTRACTION_MODEL: ${{ vars.NVIDIA_NIM_EXTRACTION_MODEL }}
       FILINGFORGE_VERSION: e930f5daef85b6d233fe6b4f63c12086b395cdfd
 
     steps:
