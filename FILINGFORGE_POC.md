@@ -6,7 +6,8 @@ for interactive developer exploration of a local library.
 
 ## What the POC does
 
-1. Pulls BSE filings with a pinned FilingForge commit.
+1. Pulls BSE filings with a pinned FilingForge commit. Ambiguous names can be
+  pinned as `name|BSE-scrip-code`.
 2. Converts all available categories to Markdown.
 3. Uploads Markdown and a stable per-company manifest to private Azure Blob
    Storage. PDFs are temporary conversion inputs and are deleted.
@@ -98,7 +99,7 @@ No Azure client secret or storage key is needed.
 
 Open **Actions > FilingForge Research POC > Run workflow**:
 
-- Companies: `SHILPAMED,MARUTI,HDFCBANK`
+- Companies: `SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180`
 - Years: `2`
 - Run AI analysis: `true`
 - Maximum documents: `10`
@@ -106,6 +107,14 @@ Open **Actions > FilingForge Research POC > Run workflow**:
   beginning/middle/end coverage after the first run succeeds
 
 For the cheapest storage-only smoke test, set AI analysis to `false`.
+
+The workflow deliberately completes all slow FilingForge downloads and NVIDIA
+analysis between two Azure logins. The first login immediately validates OIDC,
+both Blob containers, the Table endpoint, the NVIDIA key, and the selected
+model before any filings are downloaded. The second login obtains a fresh OIDC
+token immediately before the short upload-only phase. This prevents
+`AADSTS700024` when a five-minute GitHub federated assertion expires during a
+long download and fails fast when any configuration is wrong.
 
 Expected Blob paths:
 
@@ -149,6 +158,24 @@ The `latest.json` contract is documented in
   screening require deterministic XBRL/feed ingestion into Azure SQL. LLM
   extraction is evidence for narrative research, not the numeric source of
   truth.
+
+## Troubleshooting
+
+### `AADSTS700024: Client assertion is not within its valid time range`
+
+Use the current two-phase workflow. Older workflow versions authenticated to
+Azure before downloading hundreds of filings, so the OIDC assertion had expired
+before the Python SDK first requested a Storage token. No secret changes are
+required. Re-run the workflow after updating both `filingforge-poc.yml` and
+`filingforge_poc.py`.
+
+The current workflow also runs a frontloaded preflight before FilingForge. A
+misconfigured account, expired/invalid OIDC setup, missing data-plane role, bad
+NVIDIA key, or unavailable model now fails before the long download starts.
+
+GitHub-hosted runners are ephemeral, so a failed run's downloaded files are not
+available to a later run. The first retry must download them again. Subsequent
+successful production work will add remote-manifest-aware incremental pulls.
 
 ## Next build phase
 
