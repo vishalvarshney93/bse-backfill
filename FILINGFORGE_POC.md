@@ -90,8 +90,9 @@ Secrets:
 Variables:
 
 - `FILINGFORGE_STORAGE_ACCOUNT`: the value of `$storageAccount`
-- `NVIDIA_NIM_MODEL`: a tested chat-completions model, initially the same model
-  used by the announcement Function App
+- `NVIDIA_NIM_MODEL`: the full publisher/model identifier, including `/`, such
+  as `nvidia/nemotron-3-ultra-550b-a55b` or
+  `nvidia/nemotron-3.5-lightning-30b-a3b`
 
 No Azure client secret or storage key is needed.
 
@@ -176,6 +177,19 @@ NVIDIA key, or unavailable model now fails before the long download starts.
 GitHub-hosted runners are ephemeral, so a failed run's downloaded files are not
 available to a later run. The first retry must download them again. Subsequent
 successful production work will add remote-manifest-aware incremental pulls.
+
+### `TableClient.query_entities() missing query_filter`
+
+Update `filingforge_poc.py` to the current version. Azure Tables SDK 12.7.0
+requires an explicit query filter even for a one-row preflight probe. The
+current implementation queries the known `FILINGFORGE_POC` partition and works
+whether the table is empty or populated.
+
+### `NVIDIA_NIM_MODEL must include its publisher prefix`
+
+The model variable must contain the slash after `nvidia`. For example, use
+`nvidia/nemotron-3-ultra-550b-a55b`, not
+`nvidianemotron-3-ultra-550b-a55b`.
 
 ## Next build phase
 
