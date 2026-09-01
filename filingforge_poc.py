@@ -328,11 +328,11 @@ class NvidiaClient:
     def __init__(self) -> None:
         self.api_key = os.environ.get("NVIDIA_NIM_API_KEY", "").strip()
         self.model = (
-            os.environ.get("NVIDIA_NIM_MODEL") or "nvidia/nvidia-nemotron-nano-9b-v2"
+            os.environ.get("NVIDIA_NIM_MODEL") or "nvidia/nemotron-3.5-lightning-30b-a3b"
         ).strip()
         validate_nvidia_model_id(self.model)
         self.extraction_model = (
-            os.environ.get("NVIDIA_NIM_EXTRACTION_MODEL") or "nvidia/nvidia-nemotron-nano-9b-v2"
+            os.environ.get("NVIDIA_NIM_EXTRACTION_MODEL") or "nvidia/mistral-nemo-minitron-8b-8k-instruct"
         ).strip()
         validate_nvidia_model_id(self.extraction_model)
         self.base_url = os.environ.get(
@@ -362,8 +362,26 @@ class NvidiaClient:
         ]
         if unavailable:
             raise RuntimeError(f"NVIDIA model(s) not available to this API key: {', '.join(sorted(unavailable))}")
+
+        probed_models: set[str] = set()
+        for model, configured_timeout in (
+            (self.extraction_model, self.extraction_timeout),
+            (self.model, self.synthesis_timeout),
+        ):
+            if model in probed_models:
+                continue
+            result = self.json_completion(
+                "Return JSON only.",
+                'Return exactly {"ok": true}.',
+                max_tokens=32,
+                model=model,
+                timeout_seconds=min(configured_timeout, 30),
+            )
+            if result.get("ok") is not True:
+                raise NvidiaResponseError(f"NVIDIA preflight returned an unexpected response for {model}")
+            probed_models.add(model)
         log.info(
-            "NVIDIA preflight passed for synthesis=%s, extraction=%s",
+            "NVIDIA completion preflight passed for synthesis=%s, extraction=%s",
             self.model,
             self.extraction_model,
         )
@@ -750,9 +768,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.preflight:
-        AzureStore().preflight()
         if not args.skip_analysis:
             NvidiaClient().preflight()
+        AzureStore().preflight()
         return 0
     if args.prepare_only and args.upload_only:
         raise SystemExit("--prepare-only and --upload-only cannot be combined")
