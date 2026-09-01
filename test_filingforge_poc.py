@@ -31,13 +31,22 @@ from filingforge_poc import (
 class FakeNvidiaClient:
     def __init__(self):
         self.calls = 0
+        self.requests = []
         self.model = "nvidia/test-synthesis"
         self.extraction_model = "nvidia/test-extraction"
         self.extraction_timeout = 1
         self.synthesis_timeout = 1
 
-    def json_completion(self, system, user, max_tokens=6000, model=None, timeout_seconds=None):
+    def json_completion(self, system, user, max_tokens=6000, model=None, timeout_seconds=None, **kwargs):
         self.calls += 1
+        self.requests.append(
+            {
+                "max_tokens": max_tokens,
+                "model": model,
+                "timeout_seconds": timeout_seconds,
+                **kwargs,
+            }
+        )
         if self.calls == 1:
             return {
                 "claims": [
@@ -229,6 +238,53 @@ class FilingForgePocTests(unittest.TestCase):
 
         client.session.post.assert_called_once()
 
+    def test_nvidia_streaming_payload_matches_reasoning_profile(self):
+        response = mock.Mock(status_code=200)
+        response.iter_lines.return_value = [
+            'data: {"choices":[{"delta":{"reasoning_content":"checking"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"{\\"ok\\":"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"true}"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        client = object.__new__(NvidiaClient)
+        client.api_key = "test-key"
+        client.base_url = "https://example.invalid/v1"
+        client.model = "nvidia/nemotron-3.5-lightning-30b-a3b"
+        client.synthesis_timeout = 180
+        client.session = mock.Mock()
+        client.session.post.return_value = response
+
+        result = client.json_completion(
+            "Return JSON only.",
+            "Return an object.",
+            max_tokens=32768,
+            temperature=0.2,
+            top_p=0.95,
+            enable_thinking=True,
+            reasoning_budget=8192,
+            stream=True,
+        )
+
+        self.assertEqual(result, {"ok": True})
+        request = client.session.post.call_args
+        self.assertTrue(request.kwargs["stream"])
+        self.assertEqual(
+            request.kwargs["json"],
+            {
+                "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "messages": [
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": "Return an object."},
+                ],
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "max_tokens": 32768,
+                "chat_template_kwargs": {"enable_thinking": True},
+                "stream": True,
+                "reasoning_budget": 8192,
+            },
+        )
+
     def test_nvidia_model_id_requires_publisher_prefix(self):
         self.assertEqual(
             validate_nvidia_model_id("nvidia/nemotron-3.5-lightning-30b-a3b"),
@@ -308,6 +364,7 @@ class FilingForgePocTests(unittest.TestCase):
             client = FakeNvidiaClient()
             claims = extract_supported_claims(client, record, filing.read_text(encoding="utf-8"))
             self.assertEqual(len(claims), 1)
+            self.assertEqual(client.requests[0]["max_tokens"], 4096)
             self.assertEqual(claims[0]["citation"]["document_id"], record.document_id)
             self.assertEqual(claims[0]["citation"]["content_sha256"], record.content_sha256)
 
@@ -327,6 +384,19 @@ class FilingForgePocTests(unittest.TestCase):
 
             client.json_completion = synthesis_with_real_id
             research = synthesize_company_research(client, record.company_key, claims)
+            self.assertEqual(
+                client.requests[1],
+                {
+                    "max_tokens": 32768,
+                    "model": "nvidia/test-synthesis",
+                    "timeout_seconds": 1,
+                    "temperature": 0.2,
+                    "top_p": 0.95,
+                    "enable_thinking": True,
+                    "reasoning_budget": 8192,
+                    "stream": True,
+                },
+            )
             self.assertEqual(research["overview"]["sections"][0]["heading"], "Business model")
             self.assertEqual(research["management_guidance"][0]["guidance_id"], "G1")
             self.assertEqual(research["walk_the_talk"][0]["status"], "pending")
@@ -421,3 +491,4 @@ class FilingForgePocTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
