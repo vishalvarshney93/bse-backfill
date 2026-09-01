@@ -176,9 +176,11 @@ before the Python SDK first requested a Storage token. No secret changes are
 required. Re-run the workflow after updating both `filingforge-poc.yml` and
 `filingforge_poc.py`.
 
-The current workflow also runs a frontloaded preflight before FilingForge. A
-misconfigured account, expired/invalid OIDC setup, missing data-plane role, bad
-NVIDIA key, or unavailable model now fails before the long download starts.
+The current workflow also runs a frontloaded preflight before FilingForge. It
+sends a tiny JSON completion to each distinct configured NVIDIA model before
+checking Azure. A misconfigured account, expired/invalid OIDC setup, missing
+data-plane role, invalid NVIDIA key, retired model, or failed completion now
+fails before the long download starts.
 
 GitHub-hosted runners are ephemeral, so a failed run's downloaded files are not
 available to a later run. The first retry must download them again. Subsequent
