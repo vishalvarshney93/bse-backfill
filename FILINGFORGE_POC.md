@@ -157,10 +157,13 @@ The `latest.json` contract is documented in
 - NVIDIA API Catalog is a trial endpoint, not a production SLA. Ingestion must
   still succeed when analysis is disabled; query-time Research AI will use
   lexical fallback if NVIDIA reranking is unavailable.
-- NVIDIA extraction uses 12,000-character windows, a 1,400-token response cap,
+- NVIDIA extraction uses 12,000-character windows, a 4,096-token response cap,
   reasoning disabled, two attempts, and a 60-second timeout. After two failed
   windows the company is marked analysis-unavailable, but its Markdown and
   manifest still upload successfully.
+- NVIDIA synthesis uses `nvidia/nemotron-3.5-lightning-30b-a3b` by default,
+  streams the response, and sends `temperature=0.2`, `top_p=0.95`,
+  `max_tokens=32768`, thinking enabled, and `reasoning_budget=8192`.
 - Financial statements, shareholding, corporate actions, and fundamental
   screening require deterministic XBRL/feed ingestion into Azure SQL. LLM
   extraction is evidence for narrative research, not the numeric source of
