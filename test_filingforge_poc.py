@@ -16,6 +16,7 @@ from filingforge_poc import (
     select_research_documents,
     synthesize_company_research,
     upload_prepared_company,
+    validate_nvidia_model_id,
     validate_snapshot,
 )
 
@@ -122,7 +123,11 @@ class FakeContainerClient:
 
 
 class FakeReadableTableClient:
-    def query_entities(self, **kwargs):
+    def __init__(self):
+        self.query_filter = None
+
+    def query_entities(self, query_filter, **kwargs):
+        self.query_filter = query_filter
         return iter([])
 
 
@@ -135,6 +140,15 @@ class FilingForgePocTests(unittest.TestCase):
         store.preflight()
         self.assertTrue(store.markdown.checked)
         self.assertTrue(store.snapshots.checked)
+        self.assertEqual(store.state.query_filter, "PartitionKey eq 'FILINGFORGE_POC'")
+
+    def test_nvidia_model_id_requires_publisher_prefix(self):
+        self.assertEqual(
+            validate_nvidia_model_id("nvidia/nemotron-3.5-lightning-30b-a3b"),
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+        )
+        with self.assertRaisesRegex(ValueError, "nvidia/nemotron-3.5-lightning-30b-a3b"):
+            validate_nvidia_model_id("nvidianemotron-3.5-lightning-30b-a3b")
 
     def test_state_write_failure_does_not_raise(self):
         store = object.__new__(AzureStore)
