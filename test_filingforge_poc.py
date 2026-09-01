@@ -11,6 +11,7 @@ import requests
 from filingforge_poc import (
     AzureStore,
     NvidiaClient,
+    NvidiaRequestError,
     build_document_record,
     build_manifest,
     document_windows,
@@ -198,6 +199,35 @@ class FilingForgePocTests(unittest.TestCase):
         )
         self.assertTrue(all(call.kwargs["max_tokens"] == 32 for call in client.json_completion.call_args_list))
         self.assertTrue(all(call.kwargs["timeout_seconds"] == 30 for call in client.json_completion.call_args_list))
+
+    def test_blank_extraction_model_reuses_synthesis_model(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "NVIDIA_NIM_API_KEY": "test-key",
+                "NVIDIA_NIM_MODEL": "nvidia/test-synthesis",
+                "NVIDIA_NIM_EXTRACTION_MODEL": "",
+            },
+            clear=True,
+        ):
+            client = NvidiaClient()
+        self.assertEqual(client.extraction_model, "nvidia/test-synthesis")
+
+    def test_permanent_nvidia_404_names_model_without_retrying(self):
+        response = mock.Mock(status_code=404)
+        response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+        client = object.__new__(NvidiaClient)
+        client.api_key = "test-key"
+        client.base_url = "https://example.invalid/v1"
+        client.model = "nvidia/test-model"
+        client.synthesis_timeout = 180
+        client.session = mock.Mock()
+        client.session.post.return_value = response
+
+        with self.assertRaisesRegex(NvidiaRequestError, "nvidia/test-model.*HTTP 404"):
+            client.json_completion("Return JSON only.", "Return an object.")
+
+        client.session.post.assert_called_once()
 
     def test_nvidia_model_id_requires_publisher_prefix(self):
         self.assertEqual(
