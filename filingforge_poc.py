@@ -201,27 +201,54 @@ def parse_company_spec(company_spec: str) -> tuple[str, str | None]:
     return query, scrip_code or None
 
 
-def run_filingforge(company_spec: str, library_root: Path, years: float) -> str:
-    from engine import BSEClient, build_library, resolve
-
+def resolve_company_spec(company_spec: str, client, resolver=None) -> tuple[str, str, str]:
     query, expected_scrip_code = parse_company_spec(company_spec)
-    client = BSEClient()
+    if expected_scrip_code and not re.fullmatch(r"\d{6}", expected_scrip_code):
+        raise ValueError(f"Pinned BSE scrip code must be exactly six digits: {expected_scrip_code!r}")
+
+    if resolver is None:
+        from engine import resolve as resolver
+
+    candidates = []
     try:
-        candidates = resolve(query, client)
+        candidates = resolver(query, client)
+    except Exception as exc:
+        if not expected_scrip_code:
+            raise
+        log.warning(
+            "%r did not resolve by name (%s); using pinned BSE scrip code %s",
+            query,
+            exc,
+            expected_scrip_code,
+        )
+
+    if expected_scrip_code:
         chosen = next(
             (candidate for candidate in candidates if str(candidate.scrip_code) == expected_scrip_code),
             None,
-        ) if expected_scrip_code else next((candidate for candidate in candidates if candidate.is_primary), candidates[0])
-        if chosen is None:
-            available = ", ".join(f"{candidate.company} ({candidate.scrip_code})" for candidate in candidates[:10])
-            raise RuntimeError(
-                f"{query!r} did not resolve to requested BSE scrip code {expected_scrip_code}. "
-                f"Candidates: {available or 'none'}"
-            )
-        ticker = f"{chosen.company.split()[0].upper()}-{chosen.scrip_code}"
-        log.info("Pulling %s (%s) with FilingForge (%g years)", chosen.company, chosen.scrip_code, years)
+        )
+        company_name = chosen.company if chosen else query
+        scrip_code = expected_scrip_code
+    else:
+        if not candidates:
+            raise RuntimeError(f"{query!r} did not resolve to a BSE company")
+        chosen = next((candidate for candidate in candidates if candidate.is_primary), candidates[0])
+        company_name = chosen.company
+        scrip_code = str(chosen.scrip_code)
+
+    ticker_prefix = re.sub(r"[^A-Z0-9]+", "", company_name.split()[0].upper()) or scrip_code
+    return company_name, scrip_code, f"{ticker_prefix}-{scrip_code}"
+
+
+def run_filingforge(company_spec: str, library_root: Path, years: float) -> str:
+    from engine import BSEClient, build_library
+
+    client = BSEClient()
+    try:
+        company_name, scrip_code, ticker = resolve_company_spec(company_spec, client)
+        log.info("Pulling %s (%s) with FilingForge (%g years)", company_name, scrip_code, years)
         result = build_library(
-            chosen.scrip_code,
+            scrip_code,
             ticker,
             library_root,
             [],
@@ -985,23 +1012,13 @@ def main() -> int:
             seed_store = AzureStore()
             for company in companies:
                 try:
-                    query, expected_scrip_code = parse_company_spec(company)
-                    from engine import BSEClient, resolve
+                    from engine import BSEClient
 
                     client = BSEClient()
                     try:
-                        candidates = resolve(query, client)
+                        _company_name, _scrip_code, company_key = resolve_company_spec(company, client)
                     finally:
                         client.close()
-                    chosen = next(
-                        (candidate for candidate in candidates if str(candidate.scrip_code) == expected_scrip_code),
-                        None,
-                    ) if expected_scrip_code else next(
-                        (candidate for candidate in candidates if candidate.is_primary), candidates[0]
-                    )
-                    if chosen is None:
-                        raise RuntimeError(f"Could not resolve {company!r} for Azure hydration")
-                    company_key = f"{chosen.company.split()[0].upper()}-{chosen.scrip_code}"
                     seed_store.hydrate_company_library(company_key, library_root / company_key)
                 except Exception:
                     failures.append(company)

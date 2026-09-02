@@ -7,7 +7,9 @@ for interactive developer exploration of a local library.
 ## What the POC does
 
 1. Pulls BSE filings with a pinned FilingForge commit. Ambiguous names can be
-  pinned as `name|BSE-scrip-code`.
+  pinned as `name|BSE-scrip-code`; a valid six-digit pinned code is
+  authoritative even when BSE's name-search endpoint rejects punctuation or
+  spelling in the display name.
 2. Converts all available categories to Markdown.
 3. Uploads Markdown and a stable per-company manifest to private Azure Blob
    Storage. PDFs are temporary conversion inputs and are deleted.

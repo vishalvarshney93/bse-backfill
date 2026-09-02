@@ -21,6 +21,7 @@ from filingforge_poc import (
     parse_company_spec,
     parse_args,
     process_company,
+    resolve_company_spec,
     select_research_documents,
     synthesize_company_research,
     upload_prepared_company,
@@ -432,6 +433,15 @@ class FilingForgePocTests(unittest.TestCase):
     def test_company_specs_can_pin_ambiguous_names_to_bse_scrip_code(self):
         self.assertEqual(parse_company_spec("Maruti Suzuki India|532500"), ("Maruti Suzuki India", "532500"))
         self.assertEqual(parse_company_spec("SHILPAMED"), ("SHILPAMED", None))
+
+    def test_pinned_larsen_code_survives_name_resolver_failure(self):
+        def failing_resolver(_query, _client):
+            raise RuntimeError("no BSE match for 'Larsen & Toubro'")
+
+        self.assertEqual(
+            resolve_company_spec("Larsen & Toubro|500510", object(), resolver=failing_resolver),
+            ("Larsen & Toubro", "500510", "LARSEN-500510"),
+        )
 
     def test_manifest_and_cited_research_contract(self):
         with tempfile.TemporaryDirectory() as temp:
