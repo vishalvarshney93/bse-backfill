@@ -358,8 +358,10 @@ def resolve_company_spec(company_spec: str, client, resolver=None) -> tuple[str,
 
 
 def run_filingforge(company_spec: str, library_root: Path, years: float) -> str:
+    from filingforge_windowed_fetch import install_year_window_fetcher
     from engine import BSEClient, build_library
 
+    install_year_window_fetcher()
     client = BSEClient()
     try:
         company_name, scrip_code, ticker = resolve_company_spec(company_spec, client)

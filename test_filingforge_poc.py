@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -42,6 +43,7 @@ from filingforge_poc import (
     write_cached_claims,
 )
 from select_research_backfill_batch import claim_company_specs, select_company_specs
+from filingforge_windowed_fetch import _windowed_list_all_filings
 
 
 class BackfillBatchSelectionTests(unittest.TestCase):
@@ -152,6 +154,61 @@ class BackfillBatchSelectionTests(unittest.TestCase):
             ),
             ["First Ltd|500001"],
         )
+
+
+class WindowedFilingFetchTests(unittest.TestCase):
+    def test_twenty_year_pull_uses_one_year_windows_and_deduplicates(self):
+        ann_url = "https://example.invalid/announcements"
+
+        @dataclass
+        class Filing:
+            news_id: str
+            date: str
+            headline: str
+            attachment: str
+            folder: str
+            category: str
+
+        class FakeClient:
+            def __init__(self):
+                self.announcement_params = []
+
+            def get_json(self, url, params):
+                self.announcement_params.append(params)
+                if params["pageno"] != "1":
+                    return {"Table": []}
+                return {"Table": [{
+                    "NEWSID": f"news-{params['strPrevDate']}",
+                    "DissemDT": f"{params['strPrevDate'][:4]}-01-01T10:00:00",
+                    "HEADLINE": "Company update",
+                    "ATTACHMENTNAME": f"{params['strPrevDate']}.pdf",
+                    "CATEGORYNAME": "Company Update",
+                    "SUBCATNAME": "Press Release / Media Release",
+                }]}
+
+        client = FakeClient()
+        filings = _windowed_list_all_filings(
+            "500002", [], 20, client, everything=True,
+            _dependencies={
+                "FilingForgeError": RuntimeError,
+                "ANN_URL": ann_url,
+                "attachment_id": lambda value: value.rsplit("/", 1)[-1].lower(),
+                "classify": lambda row, specs, everything: (
+                    "company-update", "Company Update"
+                ),
+                "list_annual_reports": lambda scrip_code, client, years: [],
+                "Filing": Filing,
+            },
+        )
+        first_pages = [
+            params for params in client.announcement_params if params["pageno"] == "1"
+        ]
+        self.assertEqual(len(first_pages), 20)
+        self.assertEqual(len(filings), 20)
+        for params in first_pages:
+            start = datetime.strptime(params["strPrevDate"], "%Y%m%d")
+            end = datetime.strptime(params["strToDate"], "%Y%m%d")
+            self.assertLessEqual((end - start).days, 364)
 
 
 class FakeNvidiaClient:

@@ -271,9 +271,7 @@ subscription are the personal ones above.
 
 The public `filingforge-poc.yml` workflow starts every ten minutes,
 including weekends. Each scheduled run claims one company in ascending BSE
-scrip-code order and requests 100 years, which means all history available
-through FilingForge/BSE's electronic archive rather than a claim that 100
-literal years of digitized filings exist.
+scrip-code order and requests the latest 20 years of available history.
 Manual dispatches can still provide an explicit comma-separated company list;
 when that input is blank, `select_research_backfill_batch.py` selects the next
 bounded batch from the public SignalFeed company directory.
