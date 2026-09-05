@@ -32,7 +32,7 @@ Create a dedicated resource group and deploy `infra/filingforge-poc.bicep`.
 It creates:
 
 - One Standard LRS GPv2 storage account with shared-key access disabled.
-- Private `filings-md` and `research-snapshots` Blob containers.
+- Private `filings-md`, staging `research-snapshots`, and validated `research-published` Blob containers.
 - `ResearchIngestionState` Azure Table.
 - A lifecycle rule moving historical Markdown to Cool after 30 days.
 - Blob and Table contributor roles for the GitHub service principal.
@@ -74,7 +74,9 @@ az deployment group create `
   --resource-group $resourceGroup `
   --template-file infra/filingforge-poc.bicep `
   --parameters storageAccountName=$storageAccount githubPrincipalId=$($sp.id) `
-    operatorReaderPrincipalId=$operatorReaderPrincipalId
+    operatorReaderPrincipalId=$operatorReaderPrincipalId `
+    snapshotPublisherPrincipalId=$operatorReaderPrincipalId `
+    researchGatewayPrincipalId=7d3eb2cc-f302-422a-b390-08d4bf9179d7
 ```
 
 The signed-in Azure user running this deployment must be allowed to create role
@@ -130,7 +132,14 @@ filings-md/companies/{company-key}/manifest.json
 filings-md/companies/{company-key}/documents/{category}/{year}/{document-id}/{content-sha256}.md
 research-snapshots/companies/{company-key}/latest.json
 research-snapshots/companies/{company-key}/history/{timestamp}.json
+research-published/companies/{company-key}/latest.json
+research-published/companies/{company-key}/status.json
 ```
+
+The website gateway reads only `research-published`. Raw Markdown and staging
+snapshots are never exposed to the runtime or browser. Snapshots that fail the
+deterministic security/quality gate receive a quarantined `status.json` and no
+published `latest.json`.
 
 The `latest.json` contract is documented in
 `schemas/company-research.schema.json`.
@@ -258,12 +267,100 @@ subscription are the personal ones above.
   Markdown, every guidance/deliverable classification, and every
   walk-the-talk status before increasing the company universe.
 
+## Automatic company rotation
+
+The public `filingforge-poc.yml` workflow starts every ten minutes,
+including weekends. Each scheduled run claims one company in ascending BSE
+scrip-code order and requests 100 years, which means all history available
+through FilingForge/BSE's electronic archive rather than a claim that 100
+literal years of digitized filings exist.
+Manual dispatches can still provide an explicit comma-separated company list;
+when that input is blank, `select_research_backfill_batch.py` selects the next
+bounded batch from the public SignalFeed company directory.
+
+Configure this GitHub repository secret in addition to the existing Azure OIDC
+and NVIDIA values:
+
+- Secret `NEXT_PUBLIC_APP_URL`: the deployed SignalFeed Static Web App base URL,
+  for example `https://proud-grass-0a1018700.7.azurestaticapps.net`. Despite its
+  historical name, this is the website URL, not the Function App or Supabase.
+
+The selector uses `ResearchIngestionState` in Azure Table Storage as its
+progress ledger. It prioritizes never-processed companies in ascending six-digit
+BSE scrip-code order, retries failed companies only after a 24-hour cooldown,
+and refreshes completed companies after the configured interval only after the
+unseen universe is exhausted. The scheduled default is one company per run.
+
+Workflow-level concurrency is intentionally not serialized, so a new ten-minute
+run can start while an earlier long-history run is still active. Before work
+begins, the selector atomically creates an eight-hour Azure Table lease for the
+scrip code. Concurrent runs therefore choose different companies; abandoned
+leases expire after the workflow's six-hour maximum runtime.
+
+Each runner has isolated memory, so overlapping jobs do not combine RAM usage.
+GitHub's account/repository runner concurrency controls how many jobs execute;
+additional scheduled runs queue and may be delayed during high platform load.
+The principal external bottleneck is the hosted AI endpoint's request/rate
+limits, not aggregate runner memory.
+
+Use `nvidia/nemotron-3.5-lightning-30b-a3b` for per-window extraction and
+`nvidia/nemotron-3-super-120b-a12b` for final company synthesis. Extraction is
+high-volume and schema-constrained, so the analyst handbook is intentionally
+not repeated on every chunk. The full handbook is injected into the Super
+synthesis call, where cross-document financial judgment is required.
+
+The defaults work without model variables. Optional repository variables
+`FILINGFORGE_EXTRACTION_MODEL` and `FILINGFORGE_SYNTHESIS_MODEL` can override
+them if a model is retired. Legacy `NVIDIA_NIM_MODEL` workflow variables are
+intentionally ignored so they cannot accidentally route both stages to the
+same model.
+
+Shadow dense retrieval uses `nvidia/nemotron-3-embed-1b` by default, optionally
+overridden with `FILINGFORGE_EMBEDDING_MODEL`. Each logical filing receives one
+full 2,048-dimensional, L2-normalized float32 vector built from its validated
+claims, title, category, date, headings, and quotes. Vectors are consolidated
+into one binary pack plus one metadata file per company and reused when the
+document and passage hashes are unchanged. Markdown packing reduces Blob object
+count but does not reduce logical document/vector count: ten million filings
+still imply ten million vectors, approximately 82 GB before metadata.
+
+The Function currently runs these vectors in shadow mode. It records dense vs.
+lexical top-result overlap internally but leaves user-visible evidence ordering
+unchanged. Lexical retrieval remains the automatic fallback when vector packs
+or the embedding endpoint are unavailable.
+
+Backfill remains asynchronous and independent from Ask AI requests. PDFs are
+temporary converter inputs on the ephemeral GitHub runner. The upload and
+verification steps permit only durable Markdown, manifests, research JSON,
+and publication status; they fail if a PDF appears in either Blob container.
+
+Markdown is not stored as one Blob per filing. The producer combines documents
+into deterministic, content-addressed plain-Markdown packs targeting 8 MiB per
+Blob. The manifest records each document's pack name, pack SHA-256, byte offset,
+byte length, and original document SHA-256. Hydration downloads each pack once,
+verifies the pack, restores exact document slices, and verifies every slice.
+A single filing larger than the target remains one oversized pack so it is not
+split across objects. Legacy individual Markdown and per-document claim blobs
+are removed only after the packed upload passes read-after-write verification.
+
+Scheduled runs fetch all available history but checkpoint AI extraction at 25
+new uncached documents per run so a large company cannot lose six hours of work
+at GitHub's hosted-job ceiling. Partial companies are prioritized after their
+24-hour cooldown until every eligible annual report, quarterly result, investor
+presentation, and concall has been extracted. Long documents use overlapping
+12,000-character windows from beginning to end. Validated per-document claims
+are cached by document ID and content SHA-256 in Azure, so unchanged documents
+are never billed for extraction again. The complete normalized evidence index
+is retained separately. Only the final company-level synthesis is bounded (600
+newest claims / 700,000 JSON chars); this does not reduce extraction coverage.
+
 ## Known POC boundaries
 
 - FilingForge does not OCR image-only PDFs. The manifest should eventually
   preserve an `extraction_status` for these gaps.
-- The POC analyzes only a bounded document sample. Production analysis will use
-  staged evidence extraction over all high-value artifacts.
+- Scheduled production eventually analyzes all eligible documents and all
+  chunks through content-addressed checkpoints. Manual runs may set `0` to
+  attempt complete extraction in one run when the corpus is known to be small.
 - NVIDIA API Catalog is a trial endpoint, not a production SLA. Ingestion must
   still succeed when analysis is disabled; query-time Research AI will use
   lexical fallback if NVIDIA reranking is unavailable.
@@ -278,6 +375,13 @@ subscription are the personal ones above.
   screening require deterministic XBRL/feed ingestion into Azure SQL. LLM
   extraction is evidence for narrative research, not the numeric source of
   truth.
+- Query-time Ask AI reads the bounded validated publication plus a compressed,
+  security-filtered full-history evidence index. It performs intent-aware
+  lexical candidate generation and sends only the top evidence to synthesis.
+  NVIDIA's previously planned hosted `llama-nemotron-rerank-1b-v2` endpoint
+  returned HTTP 410 and reported end-of-life on 25 August 2026, so it is not a
+  production dependency. Add a replacement reranker only after offline recall
+  and latency evaluation demonstrates measurable lift over lexical retrieval.
 
 ## Troubleshooting
 
@@ -319,8 +423,10 @@ After the POC is accepted:
 1. Add official XBRL parsers and normalized Azure SQL fact tables.
 2. Add current/TTM company snapshots with indexes for cross-company fundamental
    filters and screeners.
-3. Add query-time lexical retrieval and NVIDIA's hosted
-   `llama-nemotron-rerank-1b-v2`; we build the integration, not the model.
+3. Publish validated full-history evidence packs and a compact retrieval index,
+  then add query-time lexical/vector candidate generation and an optional
+  neural reranker. Only the top cited evidence reaches the synthesis model;
+  the complete corpus is never placed in one query prompt.
 4. Add portfolio/watchlist/sector scope resolution.
 5. Add the detailed Fundamentals UI panels for overview, positives, risks,
    deliverables, management guidance, and walk-the-talk.

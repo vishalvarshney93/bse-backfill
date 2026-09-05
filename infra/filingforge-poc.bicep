@@ -9,6 +9,12 @@ param githubPrincipalId string = ''
 @description('Object ID of a user or group allowed to inspect POC Blob and Table data. Leave blank to skip.')
 param operatorReaderPrincipalId string = ''
 
+@description('Object ID of the production Research Gateway managed identity. Leave blank to skip read access.')
+param researchGatewayPrincipalId string = ''
+
+@description('Object ID of the user or service principal allowed to publish validated projections. Leave blank to skip.')
+param snapshotPublisherPrincipalId string = ''
+
 @allowed([
   'User'
   'Group'
@@ -63,6 +69,14 @@ resource filingsContainer 'Microsoft.Storage/storageAccounts/blobServices/contai
 resource researchContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobService
   name: 'research-snapshots'
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+resource publishedContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'research-published'
   properties: {
     publicAccess: 'None'
   }
@@ -131,6 +145,36 @@ resource researchBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
+resource publishedBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(githubPrincipalId)) {
+  name: guid(publishedContainer.id, githubPrincipalId, blobContributorRoleId)
+  scope: publishedContainer
+  properties: {
+    principalId: githubPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobContributorRoleId)
+  }
+}
+
+resource researchGatewayReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(researchGatewayPrincipalId)) {
+  name: guid(publishedContainer.id, researchGatewayPrincipalId, blobReaderRoleId)
+  scope: publishedContainer
+  properties: {
+    principalId: researchGatewayPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobReaderRoleId)
+  }
+}
+
+resource snapshotPublisherRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(snapshotPublisherPrincipalId)) {
+  name: guid(publishedContainer.id, snapshotPublisherPrincipalId, blobContributorRoleId)
+  scope: publishedContainer
+  properties: {
+    principalId: snapshotPublisherPrincipalId
+    principalType: 'User'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobContributorRoleId)
+  }
+}
+
 resource tableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(githubPrincipalId)) {
   name: guid(ingestionState.id, githubPrincipalId, tableContributorRoleId)
   scope: ingestionState
@@ -154,6 +198,16 @@ resource filingsOperatorReaderRole 'Microsoft.Authorization/roleAssignments@2022
 resource researchOperatorReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorReaderPrincipalId)) {
   name: guid(researchContainer.id, operatorReaderPrincipalId, blobReaderRoleId)
   scope: researchContainer
+  properties: {
+    principalId: operatorReaderPrincipalId
+    principalType: operatorReaderPrincipalType
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobReaderRoleId)
+  }
+}
+
+resource publishedOperatorReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorReaderPrincipalId)) {
+  name: guid(publishedContainer.id, operatorReaderPrincipalId, blobReaderRoleId)
+  scope: publishedContainer
   properties: {
     principalId: operatorReaderPrincipalId
     principalType: operatorReaderPrincipalType

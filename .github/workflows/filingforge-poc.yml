@@ -1,17 +1,29 @@
 name: FilingForge Research POC
 
 on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
     inputs:
       companies:
-        description: "Comma-separated name|BSE-scrip-code values"
-        required: true
-        default: "SHILPAMED|530549,Maruti Suzuki India|532500,HDFC Bank|500180"
+        description: "Optional comma-separated name|BSE-scrip-code values; blank selects the next Azure-tracked batch"
+        required: false
+        default: ""
         type: string
-      years:
-        description: "Years of FilingForge history (0.5 = six months)"
+      batch_size:
+        description: "Automatic rotation batch size when companies is blank"
         required: true
-        default: 2
+        default: 1
+        type: number
+      refresh_days:
+        description: "Refresh completed companies after this many days"
+        required: true
+        default: 30
+        type: number
+      years:
+        description: "Years of FilingForge history (100 = all available electronic history)"
+        required: true
+        default: 100
         type: number
       run_ai_analysis:
         description: "Generate cited NVIDIA research snapshots"
@@ -19,38 +31,39 @@ on:
         default: true
         type: boolean
       max_analysis_documents:
-        description: "Maximum documents analyzed per company"
+        description: "Maximum new uncached documents extracted this run (0 = attempt all)"
         required: true
-        default: 10
+        default: 25
         type: number
       max_windows_per_document:
-        description: "Windows sampled across each long document"
+        description: "Windows extracted per document (0 = complete overlapping coverage)"
         required: true
-        default: 2
+        default: 0
         type: number
 
 permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: filingforge-poc
-  cancel-in-progress: false
-
 jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 359
     env:
-      INPUT_COMPANIES: ${{ inputs.companies }}
-      INPUT_YEARS: ${{ inputs.years }}
-      INPUT_RUN_AI: ${{ inputs.run_ai_analysis }}
-      INPUT_MAX_DOCS: ${{ inputs.max_analysis_documents }}
+      INPUT_COMPANIES: ${{ inputs.companies || '' }}
+      INPUT_BATCH_SIZE: ${{ inputs.batch_size || 1 }}
+      INPUT_REFRESH_DAYS: ${{ inputs.refresh_days || 30 }}
+      INPUT_YEARS: ${{ inputs.years || 100 }}
+      INPUT_RUN_AI: ${{ github.event_name == 'schedule' || inputs.run_ai_analysis }}
+      INPUT_MAX_DOCS: ${{ inputs.max_analysis_documents || 25 }}
       INPUT_MAX_WINDOWS: ${{ inputs.max_windows_per_document }}
       AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
+      SIGNALFEED_APP_BASE_URL: ${{ secrets.NEXT_PUBLIC_APP_URL }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
-      NVIDIA_NIM_MODEL: ${{ vars.NVIDIA_NIM_MODEL }}
-      NVIDIA_NIM_EXTRACTION_MODEL: ${{ vars.NVIDIA_NIM_EXTRACTION_MODEL }}
+      NVIDIA_NIM_MODEL: ${{ vars.FILINGFORGE_SYNTHESIS_MODEL || 'nvidia/nemotron-3-super-120b-a12b' }}
+      NVIDIA_NIM_EXTRACTION_MODEL: ${{ vars.FILINGFORGE_EXTRACTION_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b' }}
+      NVIDIA_NIM_EMBEDDING_MODEL: ${{ vars.FILINGFORGE_EMBEDDING_MODEL || 'nvidia/nemotron-3-embed-1b' }}
+      RESEARCH_ANALYST_HANDBOOK: research_analyst_grounding.md
       FILINGFORGE_VERSION: e930f5daef85b6d233fe6b4f63c12086b395cdfd
 
     steps:
@@ -100,18 +113,38 @@ jobs:
           fi
           python filingforge_poc.py "${args[@]}"
 
+      - name: Select automatic company batch
+        id: select-batch
+        if: ${{ env.INPUT_COMPANIES == '' }}
+        run: >-
+          python select_research_backfill_batch.py
+          --batch-size "$INPUT_BATCH_SIZE"
+          --refresh-days "$INPUT_REFRESH_DAYS"
+          --lease-hours 8
+
+      - name: Resolve company batch
+        shell: bash
+        run: |
+          companies="$INPUT_COMPANIES"
+          if [[ -z "$companies" ]]; then
+            companies="${{ steps.select-batch.outputs.companies }}"
+          fi
+          echo "RESOLVED_COMPANIES=$companies" >> "$GITHUB_ENV"
+          echo "Resolved batch size: ${{ steps.select-batch.outputs.count || 'manual' }}"
+
       - name: Pull, convert, and analyze locally
         id: prepare
+        if: ${{ env.RESOLVED_COMPANIES != '' }}
         continue-on-error: true
         shell: bash
         run: |
           args=(
-            --companies "$INPUT_COMPANIES"
+            --companies "$RESOLVED_COMPANIES"
             --years "$INPUT_YEARS"
             --library-root FilingForgeLibrary
             --output-root poc-output
             --max-analysis-documents "$INPUT_MAX_DOCS"
-            --max-windows-per-document "$INPUT_MAX_WINDOWS"
+            --max-windows-per-document "${INPUT_MAX_WINDOWS:-0}"
             --seed-from-azure
             --prepare-only
           )
@@ -137,7 +170,7 @@ jobs:
         if: ${{ always() && steps.azure-login.outcome == 'success' }}
         run: >-
           python filingforge_poc.py
-          --companies "$INPUT_COMPANIES"
+          --companies "$RESOLVED_COMPANIES"
           --library-root FilingForgeLibrary
           --output-root poc-output
           --upload-only
@@ -153,7 +186,7 @@ jobs:
         shell: bash
         run: |
           echo "## FilingForge POC" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Companies: $INPUT_COMPANIES" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Companies: $RESOLVED_COMPANIES" >> "$GITHUB_STEP_SUMMARY"
           echo "- Years: $INPUT_YEARS" >> "$GITHUB_STEP_SUMMARY"
           echo "- NVIDIA analysis: $INPUT_RUN_AI" >> "$GITHUB_STEP_SUMMARY"
           echo "- Storage account: $AZURE_STORAGE_ACCOUNT" >> "$GITHUB_STEP_SUMMARY"
