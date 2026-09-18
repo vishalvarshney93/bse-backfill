@@ -2,7 +2,7 @@ name: Document Links Research Ingestion
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2-59/6 * * * *"
   workflow_dispatch:
     inputs:
       batch_size:
