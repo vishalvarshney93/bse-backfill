@@ -2,7 +2,7 @@ name: Document Links Research Ingestion
 
 on:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       batch_size:
@@ -62,14 +62,6 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Replace legacy document redirect URLs
-        if: ${{ github.event_name == 'schedule' }}
-        run: >-
-          python document_links_ingest.py
-          --canonicalize-only
-          --canonicalize-limit 800
-          --canonicalize-delay-seconds 6.5
 
       - name: Ingest document-link batch
         shell: bash
