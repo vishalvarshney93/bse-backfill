@@ -209,6 +209,7 @@ def build_document_record(company_dir: Path, markdown_path: Path) -> DocumentRec
     title = markdown_path.stem[title_start:].split("__", 1)[0].replace("_", " ").strip()
     text = raw.decode("utf-8", errors="replace")
     frontmatter = parse_frontmatter(text)
+    title = frontmatter.get("title") or title
     source_news_id = frontmatter.get("news_id") or None
     if not source_news_id and "__" in markdown_path.stem:
         source_news_id = markdown_path.stem.rsplit("__", 1)[-1]

@@ -28,6 +28,11 @@ jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'schedule' && '[0,1]' || '[0]') }}
     env:
       AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
       SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -71,7 +76,13 @@ jobs:
       - name: Ingest document-link batch
         shell: bash
         run: |
-          args=(--batch-size "${{ inputs.batch_size || '1' }}" --seed-from-azure)
+          shard_count="${{ github.event_name == 'schedule' && '2' || '1' }}"
+          args=(
+            --batch-size "${{ inputs.batch_size || '1' }}"
+            --shard-index "${{ matrix.shard }}"
+            --shard-count "$shard_count"
+            --seed-from-azure
+          )
           if [[ "${{ github.event_name == 'schedule' || inputs.run_ai_analysis }}" != "true" ]]; then
             args+=(--skip-analysis)
           fi

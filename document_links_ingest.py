@@ -249,15 +249,22 @@ def group_documents(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
 
 
 def select_companies(
-    grouped: dict[str, list[dict[str, Any]]], state_rows: list[dict[str, Any]], batch_size: int, now: datetime | None = None,
+    grouped: dict[str, list[dict[str, Any]]],
+    state_rows: list[dict[str, Any]],
+    batch_size: int,
+    now: datetime | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> list[str]:
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("invalid company-selection shard")
     prior = {str(row.get("RowKey")): row for row in state_rows}
     candidates: list[str] = []
     for key in grouped:
         state = prior.get(key)
         if not state or state.get("Status") not in {"enabled", "not_enabled"}:
             candidates.append(key)
-    return sorted(candidates)[:batch_size]
+    return sorted(candidates)[shard_index::shard_count][:batch_size]
 
 
 def markdown_from_pdf(
@@ -298,16 +305,19 @@ def markdown_from_pdf(
         raise DocumentExtractionError("PDF text extraction was too thin after OCR")
     title = re.sub(r"\s+", " ", str(document.get("company_name") or document["scrip_code"])).strip()
     period = str(document.get("doc_period_end_date") or "unknown")
+    document_label = document["doc_type"].replace("_", " ").title()
+    display_title = f"{title} {document_label} ({period})"
     source_url = public_document_url(resolved_source_url or str(document["pdf_url"]))
     return (
         "---\n"
         f"news_id: direct-{document['id']}\n"
         f"source_pdf: {source_url}\n"
+        f"title: {display_title}\n"
         f"document_type: {document['doc_type']}\n"
         f"period_end_date: {period}\n"
         "extracted: ok\n"
         "---\n\n"
-        f"# {title} {document['doc_type'].replace('_', ' ').title()} ({period})\n\n{text}\n"
+        f"# {display_title}\n\n{text}\n"
     )
 
 
@@ -550,6 +560,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canonicalize-only", action="store_true")
     parser.add_argument("--canonicalize-limit", type=int, default=800)
     parser.add_argument("--canonicalize-delay-seconds", type=float, default=6.5)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     return parser.parse_args()
 
 
@@ -563,6 +575,8 @@ def main() -> int:
         raise SystemExit("--canonicalize-limit must be between 1 and 2000")
     if args.canonicalize_delay_seconds < 1:
         raise SystemExit("--canonicalize-delay-seconds must be at least 1")
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        raise SystemExit("--shard-index must be between 0 and shard-count minus 1")
     library_root = Path(args.library_root).resolve()
     output_root = Path(args.output_root).resolve()
     library_root.mkdir(parents=True, exist_ok=True)
@@ -583,9 +597,16 @@ def main() -> int:
 
     all_grouped = group_documents(fetch_documents())
     existing_state = state_rows(store)
-    initialize_company_audit(store, all_grouped, existing_state)
+    if args.shard_index == 0:
+        initialize_company_audit(store, all_grouped, existing_state)
     grouped = {key: available_documents(documents, existing_state) for key, documents in all_grouped.items()}
-    selected = [key for key in args.company_keys.split(",") if key] or select_companies(grouped, existing_state, args.batch_size)
+    selected = [key for key in args.company_keys.split(",") if key] or select_companies(
+        grouped,
+        existing_state,
+        args.batch_size,
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
+    )
     if not selected:
         print("No document-link companies require ingestion")
         return 0

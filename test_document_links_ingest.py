@@ -66,6 +66,17 @@ class DocumentLinkIngestTests(unittest.TestCase):
             ["ISSUER-500001"],
         )
 
+    def test_company_selection_shards_do_not_overlap(self):
+        grouped = {
+            f"ISSUER-{scrip_code}": [{"id": scrip_code}]
+            for scrip_code in ("500001", "500002", "500003", "500004")
+        }
+        first = ingest.select_companies(grouped, [], 2, shard_index=0, shard_count=2)
+        second = ingest.select_companies(grouped, [], 2, shard_index=1, shard_count=2)
+        self.assertEqual(first, ["ISSUER-500001", "ISSUER-500003"])
+        self.assertEqual(second, ["ISSUER-500002", "ISSUER-500004"])
+        self.assertFalse(set(first) & set(second))
+
     def test_omits_previously_unavailable_document_links(self):
         documents = [{"id": "good"}, {"id": "broken"}]
         state = [
@@ -117,6 +128,7 @@ class DocumentLinkIngestTests(unittest.TestCase):
         pdf.close()
         markdown = ingest.markdown_from_pdf(document, data)
         self.assertIn("news_id: direct-doc-1", markdown)
+        self.assertIn("title: Issuer Ltd Quarterly Result (2026-06-30)", markdown)
         self.assertIn("extracted: ok", markdown)
         self.assertIn("source_pdf: https://issuer.example/q1.pdf", markdown)
         self.assertIn("Quarterly revenue increased", markdown)
