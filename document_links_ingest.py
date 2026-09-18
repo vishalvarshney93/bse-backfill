@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -47,6 +47,7 @@ DOCUMENT_TYPES = {
 }
 STATE_PARTITION = "DOCUMENT_LINKS"
 LEASE_PARTITION = "DOCUMENT_LINKS_LEASE"
+LEASE_DURATION = timedelta(hours=6)
 SCRIP_PATTERN = re.compile(r"^\d{6}$")
 MAX_PDF_BYTES = 40 * 1024 * 1024
 MIN_EXTRACTED_CHARS = 200
@@ -419,16 +420,36 @@ def available_documents(documents: list[dict[str, Any]], state_rows: list[dict[s
     return [document for document in documents if str(document.get("id") or "") not in unavailable]
 
 
-def claim_company_lease(store: AzureStore, key: str) -> bool:
+def claim_company_lease(store: AzureStore, key: str, now: datetime | None = None) -> bool:
+    claimed_at = now or datetime.now(timezone.utc)
+    entity = {
+        "PartitionKey": LEASE_PARTITION,
+        "RowKey": key,
+        "ClaimedAt": claimed_at.isoformat(),
+        "ExpiresAt": (claimed_at + LEASE_DURATION).isoformat(),
+    }
     try:
-        store.state.create_entity({
-            "PartitionKey": LEASE_PARTITION,
-            "RowKey": key,
-            "ClaimedAt": utc_now(),
-        })
+        store.state.create_entity(entity)
         return True
     except ResourceExistsError:
-        return False
+        try:
+            existing = store.state.get_entity(partition_key=LEASE_PARTITION, row_key=key)
+            expires_at = datetime.fromisoformat(str(existing.get("ExpiresAt") or "").replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > claimed_at:
+                return False
+            store.state.delete_entity(partition_key=LEASE_PARTITION, row_key=key)
+        except (ResourceNotFoundError, ValueError):
+            try:
+                store.state.delete_entity(partition_key=LEASE_PARTITION, row_key=key)
+            except ResourceNotFoundError:
+                pass
+        try:
+            store.state.create_entity(entity)
+            return True
+        except ResourceExistsError:
+            return False
 
 
 def release_company_lease(store: AzureStore, key: str) -> None:

@@ -1,6 +1,7 @@
 from io import BytesIO
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +11,33 @@ import document_links_ingest as ingest
 
 
 class DocumentLinkIngestTests(unittest.TestCase):
+    def test_reclaims_expired_company_lease_after_cancelled_run(self):
+        now = datetime(2026, 9, 18, 14, 0, tzinfo=timezone.utc)
+
+        class FakeState:
+            def __init__(self):
+                self.entity = {
+                    "PartitionKey": ingest.LEASE_PARTITION,
+                    "RowKey": "ISSUER-500001",
+                    "ExpiresAt": (now - timedelta(minutes=1)).isoformat(),
+                }
+
+            def create_entity(self, entity):
+                if self.entity is not None:
+                    from azure.core.exceptions import ResourceExistsError
+                    raise ResourceExistsError("exists")
+                self.entity = entity
+
+            def get_entity(self, **_kwargs):
+                return self.entity
+
+            def delete_entity(self, **_kwargs):
+                self.entity = None
+
+        store = type("Store", (), {"state": FakeState()})()
+        self.assertTrue(ingest.claim_company_lease(store, "ISSUER-500001", now))
+        self.assertGreater(datetime.fromisoformat(store.state.entity["ExpiresAt"]), now)
+
     def test_accepts_public_https_company_url(self):
         self.assertEqual(
             ingest.public_document_url("https://investor.example.com/results/q1.pdf"),
