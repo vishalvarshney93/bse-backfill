@@ -947,7 +947,7 @@ def select_research_documents(records: list[DocumentRecord], limit: int) -> list
         category: sorted(
             (
                 record for record in records
-                if record.category == category and record.extraction_status in {"ok", "unknown"}
+                if record.category == category and record.extraction_status in {"ok", "complete", "unknown"}
             ),
             key=lambda record: record.filing_date or "",
             reverse=True,
@@ -1665,7 +1665,9 @@ def process_company(
                 except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
                     failed_windows += 1
                     document_failed = True
-                    failure_messages.append(f"{record.document_id}@{source_offset}: {type(exc).__name__}")
+                    failure_messages.append(
+                        f"{record.document_id}@{source_offset}: {type(exc).__name__}: {str(exc)[:240]}"
+                    )
                     log.warning(
                         "%s: skipping timed-out/invalid NVIDIA window %s@%d: %s",
                         company_key,
@@ -1754,7 +1756,7 @@ def process_company(
                     retrieval_vectors_path,
                 )
         except (requests.RequestException, NvidiaResponseError, ValueError, OSError) as exc:
-            failure_messages.append(f"embedding: {type(exc).__name__}")
+            failure_messages.append(f"embedding: {type(exc).__name__}: {str(exc)[:240]}")
             log.warning("%s: shadow embedding index unavailable: %s", company_key, exc)
 
         if claims:
@@ -1801,7 +1803,7 @@ def process_company(
                     store.upload_snapshot(company_key, snapshot)
                     store.publish_projection(company_key, projection, publication_status)
             except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
-                failure_messages.append(f"synthesis: {type(exc).__name__}")
+                failure_messages.append(f"synthesis: {type(exc).__name__}: {str(exc)[:240]}")
                 log.warning("%s: NVIDIA synthesis unavailable; Markdown will still upload: %s", company_key, exc)
         else:
             failure_messages.append("no validated evidence extracted")
@@ -1870,7 +1872,7 @@ def upload_prepared_company(
     paths: dict[str, Path],
     output_root: Path,
     store: AzureStore,
-) -> None:
+) -> bool:
     company_records = [record for record in records if record.company_key == company_key]
     company_output = output_root / company_key
     manifest_path = company_output / "manifest.json"
@@ -1926,6 +1928,7 @@ def upload_prepared_company(
     research_path = company_output / "research.json"
     analysis_status_path = company_output / "analysis-status.json"
     has_analysis = research_path.exists()
+    published = False
     if has_analysis:
         snapshot = json.loads(research_path.read_text(encoding="utf-8"))
         validate_snapshot(snapshot)
@@ -1948,14 +1951,26 @@ def upload_prepared_company(
             }
             log.warning("%s: research snapshot quarantined during upload: %s", company_key, exc)
         store.publish_projection(company_key, projection, publication_status)
+        published = projection is not None
         store.upload_analysis_status(
             company_key,
             {"status": "available", "generated_at": snapshot["generated_at"]},
         )
     elif analysis_status_path.exists():
+        analysis_status = json.loads(analysis_status_path.read_text(encoding="utf-8"))
         store.upload_analysis_status(
             company_key,
-            json.loads(analysis_status_path.read_text(encoding="utf-8")),
+            analysis_status,
+        )
+        store.publish_projection(
+            company_key,
+            None,
+            {
+                "status": "quarantined",
+                "company_key": company_key,
+                "generated_at": analysis_status.get("generated_at", utc_now()),
+                "reasons": analysis_status.get("details", ["No publishable research snapshot was produced"]),
+            },
         )
     state_status = "complete" if extraction_complete else "partial"
     state_detail = f"analysis={has_analysis};extraction_complete={extraction_complete}"
@@ -1974,6 +1989,7 @@ def upload_prepared_company(
         {pack["blob_name"] for pack in markdown_packs},
     )
     log.info("%s: uploaded %d Markdown documents, analysis=%s", company_key, len(company_records), has_analysis)
+    return published
 
 
 def parse_args() -> argparse.Namespace:

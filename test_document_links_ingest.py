@@ -89,6 +89,7 @@ class DocumentLinkIngestTests(unittest.TestCase):
         pdf.close()
         markdown = ingest.markdown_from_pdf(document, data)
         self.assertIn("news_id: direct-doc-1", markdown)
+        self.assertIn("extracted: ok", markdown)
         self.assertIn("source_pdf: https://issuer.example/q1.pdf", markdown)
         self.assertIn("Quarterly revenue increased", markdown)
 

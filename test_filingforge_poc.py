@@ -931,6 +931,15 @@ class FilingForgePocTests(unittest.TestCase):
                 records.append(build_document_record(company, filing))
             self.assertEqual(len(select_research_documents(records, 0)), 3)
 
+    def test_direct_complete_extraction_status_is_research_eligible(self):
+        record = type("Record", (), {
+            "category": "quarterly",
+            "extraction_status": "complete",
+            "filing_date": "2026-06-30",
+            "document_id": "ff-" + "a" * 24,
+        })()
+        self.assertEqual(select_research_documents([record], 0), [record])
+
     def test_claim_cache_is_bound_to_document_content_hash(self):
         with tempfile.TemporaryDirectory() as temp:
             company = Path(temp) / "SHILPA-530549"
@@ -1044,7 +1053,7 @@ class FilingForgePocTests(unittest.TestCase):
             )
 
             store = FakeAzureStore()
-            upload_prepared_company(
+            published = upload_prepared_company(
                 record.company_key,
                 [record],
                 paths,
@@ -1052,12 +1061,14 @@ class FilingForgePocTests(unittest.TestCase):
                 store,
             )
 
+            self.assertFalse(published)
             self.assertEqual(store.documents, [])
             self.assertEqual(len(store.markdown_packs), 1)
             self.assertEqual(store.manifests[0][0], "MARUTI-532500")
             self.assertEqual(store.states[0][1:3], ("complete", 1))
             self.assertEqual(store.snapshots, [])
             self.assertEqual(store.analysis_statuses[0][1]["status"], "unavailable")
+            self.assertEqual(store.publications[0][2]["status"], "quarantined")
             self.assertEqual(
                 store.verifications,
                 [("MARUTI-532500", 1, False, True, True)],

@@ -291,7 +291,7 @@ def markdown_from_pdf(
         f"source_pdf: {source_url}\n"
         f"document_type: {document['doc_type']}\n"
         f"period_end_date: {period}\n"
-        "extracted: complete\n"
+        "extracted: ok\n"
         "---\n\n"
         f"# {title} {document['doc_type'].replace('_', ' ').title()} ({period})\n\n{text}\n"
     )
@@ -533,9 +533,19 @@ def main() -> int:
                 )
                 continue
             try:
-                process_company(key, records, paths, output_root, None, nvidia, 25, 12_000, 0)
+                process_company(key, records, paths, output_root, None, nvidia, 0, 12_000, 0)
                 if not args.prepare_only:
-                    upload_prepared_company(key, records, paths, output_root, store)
+                    published = upload_prepared_company(key, records, paths, output_root, store)
+                    if not published:
+                        failures.append(key)
+                        record_direct_state(
+                            store, key, all_documents, "error",
+                            "No publishable research snapshot was produced; the company will retry.",
+                            usable_count=len(successful_documents),
+                            unavailable_count=unavailable_count,
+                            failed_count=len(errors),
+                        )
+                        continue
                     record_direct_state(
                         store, key, all_documents, "enabled", error_detail or "ok",
                         usable_count=len(successful_documents),
