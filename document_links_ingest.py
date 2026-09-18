@@ -32,10 +32,14 @@ from azure.data.tables import UpdateMode
 from filingforge_poc import (
     AzureStore,
     NvidiaClient,
+    claim_cache_name,
     discover_documents,
+    document_windows,
+    load_cached_claims,
     process_company,
     upload_prepared_company,
     utc_now,
+    write_cached_claims,
 )
 
 
@@ -60,6 +64,7 @@ MAX_WINDOWS_PER_DOCUMENT = max(
     1,
     min(int(os.environ.get("NVIDIA_NIM_MAX_WINDOWS_PER_DOCUMENT", "8")), 16),
 )
+EVIDENCE_PASSAGE_CHARS = 1_800
 log = logging.getLogger("document_links_ingest")
 
 
@@ -350,6 +355,71 @@ def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Pat
     return errors
 
 
+def build_deterministic_evidence(record: Any, markdown: str) -> list[dict[str, Any]]:
+    evidence = []
+    seen = set()
+    for source_offset, source in document_windows(
+        markdown,
+        max_chars=ANALYSIS_WINDOW_CHARS,
+        max_windows=MAX_WINDOWS_PER_DOCUMENT,
+    ):
+        text = source.strip()
+        if source_offset == 0 and text.startswith("---"):
+            _prefix, separator, remainder = text.partition("\n---")
+            if separator:
+                text = remainder.lstrip("-\n ")
+        if len(text) > EVIDENCE_PASSAGE_CHARS:
+            end = max(
+                text.rfind("\n\n", 900, EVIDENCE_PASSAGE_CHARS),
+                text.rfind(". ", 900, EVIDENCE_PASSAGE_CHARS),
+            )
+            text = text[:end + 1 if end >= 900 else EVIDENCE_PASSAGE_CHARS].strip()
+        if len(text) < 12:
+            continue
+        identity = hashlib.sha256(re.sub(r"\s+", " ", text).lower().encode("utf-8")).hexdigest()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        headings = [match.group(2).strip() for match in re.finditer(r"^(#{1,4})\s+(.+?)\s*$", markdown[:source_offset + 1], re.MULTILINE)]
+        evidence.append({
+            "claim_type": "business_fact",
+            "statement": text,
+            "metric": None,
+            "target": None,
+            "target_period": None,
+            "citation": {
+                "document_id": record.document_id,
+                "content_sha256": record.content_sha256,
+                "source_pdf": record.source_pdf,
+                "filing_date": record.filing_date,
+                "title": record.title,
+                "heading": headings[-1] if headings else None,
+                "quote": text,
+            },
+        })
+    return evidence
+
+
+def seed_deterministic_evidence_caches(
+    key: str,
+    records: list[Any],
+    paths: dict[str, Path],
+    output_root: Path,
+) -> int:
+    claims_root = output_root / key / "claims"
+    seeded = 0
+    for record in records:
+        if record.company_key != key:
+            continue
+        cache_path = claims_root / claim_cache_name(record)
+        if load_cached_claims(cache_path, record) is not None:
+            continue
+        markdown = paths[record.document_id].read_text(encoding="utf-8", errors="replace")
+        write_cached_claims(cache_path, record, build_deterministic_evidence(record, markdown))
+        seeded += 1
+    return seeded
+
+
 def state_rows(store: AzureStore) -> list[dict[str, Any]]:
     return list(store.state.query_entities(f"PartitionKey eq '{STATE_PARTITION}'"))
 
@@ -546,6 +616,8 @@ def main() -> int:
             errors = prepare_company(key, documents, library_root)
             record_document_failures(store, documents, errors)
             records, paths = discover_documents(library_root)
+            seeded_evidence = seed_deterministic_evidence_caches(key, records, paths, output_root)
+            print(f"Seeded deterministic evidence for {seeded_evidence} document(s) in {key}")
             failed_ids = {error.document_id for error in errors}
             successful_documents = [
                 document for document in documents

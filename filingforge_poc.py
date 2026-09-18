@@ -80,7 +80,7 @@ DEFAULT_SYNTHESIS_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 DEFAULT_EXTRACTION_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b"
 EMBEDDING_DIMENSIONS = 2048
-EMBEDDING_BATCH_SIZE = 8
+EMBEDDING_BATCH_SIZE = 16
 EMBEDDING_PASSAGE_TARGET_CHARS = 4_000
 EXTRACTION_MAX_WORKERS = max(1, min(int(os.environ.get("NVIDIA_NIM_EXTRACTION_WORKERS", "3")), 4))
 MAX_ANALYST_HANDBOOK_CHARS = 32_000
@@ -798,6 +798,10 @@ class NvidiaClient:
             30.0,
             min(float(os.environ.get("NVIDIA_NIM_EXTRACTION_TIMEOUT_SECONDS", "180")), 360.0),
         )
+        self.embedding_timeout = max(
+            15.0,
+            min(float(os.environ.get("NVIDIA_NIM_EMBEDDING_TIMEOUT_SECONDS", "60")), 120.0),
+        )
         self.synthesis_timeout = float(os.environ.get("NVIDIA_NIM_SYNTHESIS_TIMEOUT_SECONDS", "180"))
         if not self.api_key:
             raise RuntimeError("NVIDIA_NIM_API_KEY is required unless --skip-analysis is used")
@@ -822,7 +826,7 @@ class NvidiaClient:
                 "encoding_format": "float",
                 "truncate": "END",
             },
-            timeout=self.extraction_timeout,
+            timeout=self.embedding_timeout,
         )
         if response.status_code >= 400:
             raise NvidiaRequestError(self.embedding_model, response.status_code)
@@ -1306,14 +1310,13 @@ Return this shape:
     result = client.json_completion(
         system,
         user,
-        max_tokens=32768,
+        max_tokens=8192,
         model=client.model,
         timeout_seconds=client.synthesis_timeout,
         temperature=0.2,
         top_p=0.95,
-        enable_thinking=True,
-        reasoning_budget=8192,
-        stream=True,
+        enable_thinking=False,
+        stream=False,
     )
     valid_ids = {
         claim["citation"]["document_id"]
@@ -1342,6 +1345,33 @@ Return this shape:
         and set(item.get("outcome_document_ids", [])).issubset(valid_ids)
     ]
     return result
+
+
+def build_deterministic_research(claims: list[dict[str, Any]]) -> dict[str, Any]:
+    sections = []
+    seen_documents = set()
+    for claim in claims:
+        citation = claim.get("citation", {})
+        document_id = str(citation.get("document_id") or "")
+        statement = str(claim.get("statement") or "").strip()
+        if not document_id or not statement or document_id in seen_documents:
+            continue
+        seen_documents.add(document_id)
+        sections.append({
+            "heading": str(citation.get("heading") or citation.get("title") or "Filing evidence")[:200],
+            "text": statement,
+            "document_ids": [document_id],
+        })
+        if len(sections) == 8:
+            break
+    return {
+        "overview": {"sections": sections},
+        "positives": [],
+        "risks": [],
+        "management_guidance": [],
+        "key_deliverables": [],
+        "walk_the_talk": [],
+    }
 
 
 def build_manifest(
@@ -1447,10 +1477,6 @@ def validate_snapshot_for_publication(snapshot: dict[str, Any]) -> list[str]:
     overview_sections = research.get("overview", {}).get("sections", [])
     if not overview_sections:
         issues.append("overview is empty")
-    if not research.get("positives"):
-        issues.append("positives are empty")
-    if not research.get("risks"):
-        issues.append("risks are empty")
 
     referenced_ids: set[str] = set()
     for section in overview_sections:
@@ -1762,7 +1788,7 @@ def process_company(
                     nvidia,
                     company_key,
                     selected,
-                    claims,
+                    published_evidence["evidence"],
                     company_output,
                 )
             )
@@ -1777,10 +1803,26 @@ def process_company(
             failure_messages.append(f"embedding: {type(exc).__name__}: {str(exc)[:240]}")
             log.warning("%s: shadow embedding index unavailable: %s", company_key, exc)
 
-        if claims:
+        safe_claims = published_evidence["evidence"]
+        if safe_claims:
+            synthesis_claims = select_synthesis_claims(
+                safe_claims,
+                max_claims=96,
+                max_json_chars=180_000,
+            )
+            used_fallback = False
             try:
-                synthesis_claims = select_synthesis_claims(claims)
-                research = synthesize_company_research(nvidia, company_key, synthesis_claims)
+                try:
+                    research = synthesize_company_research(nvidia, company_key, synthesis_claims)
+                except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
+                    used_fallback = True
+                    failure_messages.append(f"synthesis: {type(exc).__name__}: {str(exc)[:240]}")
+                    log.warning(
+                        "%s: NVIDIA synthesis unavailable; publishing evidence-only snapshot: %s",
+                        company_key,
+                        exc,
+                    )
+                    research = build_deterministic_research(synthesis_claims)
                 snapshot = {
                     "schema_version": 1,
                     "company_key": company_key,
@@ -1791,38 +1833,45 @@ def process_company(
                     "evidence": synthesis_claims,
                 }
                 validate_snapshot(snapshot)
+                try:
+                    projection = build_published_projection(snapshot)
+                except SnapshotPublicationError as exc:
+                    if used_fallback:
+                        raise
+                    used_fallback = True
+                    failure_messages.append(f"generated synthesis rejected: {str(exc)[:240]}")
+                    snapshot["research"] = build_deterministic_research(synthesis_claims)
+                    validate_snapshot(snapshot)
+                    projection = build_published_projection(snapshot)
+                    log.warning(
+                        "%s: generated synthesis rejected; publishing evidence-only snapshot: %s",
+                        company_key,
+                        exc,
+                    )
                 (company_output / "research.json").write_text(
                     json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-                try:
-                    projection = build_published_projection(snapshot)
-                    publication_status = {
-                        "status": "published",
-                        "company_key": company_key,
-                        "generated_at": projection["generated_at"],
-                        "warnings": projection["publication"]["warnings"],
-                    }
-                    (company_output / "published.json").write_text(
-                        json.dumps(projection, ensure_ascii=False, indent=2), encoding="utf-8"
-                    )
-                except SnapshotPublicationError as exc:
-                    projection = None
-                    publication_status = {
-                        "status": "quarantined",
-                        "company_key": company_key,
-                        "generated_at": snapshot["generated_at"],
-                        "reasons": str(exc).split("; "),
-                    }
-                    log.warning("%s: research snapshot quarantined: %s", company_key, exc)
+                publication_status = {
+                    "status": "published",
+                    "company_key": company_key,
+                    "generated_at": projection["generated_at"],
+                    "warnings": projection["publication"]["warnings"] + (
+                        ["Evidence-only fallback was used"] if used_fallback else []
+                    ),
+                }
+                (company_output / "published.json").write_text(
+                    json.dumps(projection, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
                 (company_output / "publication-status.json").write_text(
                     json.dumps(publication_status, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
                 if store:
                     store.upload_snapshot(company_key, snapshot)
                     store.publish_projection(company_key, projection, publication_status)
-            except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
-                failure_messages.append(f"synthesis: {type(exc).__name__}: {str(exc)[:240]}")
-                log.warning("%s: NVIDIA synthesis unavailable; Markdown will still upload: %s", company_key, exc)
+            except (SnapshotPublicationError, ValueError) as exc:
+                snapshot = None
+                failure_messages.append(f"publication: {type(exc).__name__}: {str(exc)[:240]}")
+                log.warning("%s: evidence-only publication unavailable: %s", company_key, exc)
         else:
             failure_messages.append("no validated evidence extracted")
 

@@ -681,6 +681,58 @@ class FilingForgePocTests(unittest.TestCase):
             status = json.loads((company_output / "analysis-status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["failed_windows"], 2)
 
+    def test_synthesis_timeout_publishes_evidence_only_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            company = root / "library" / "MARUTI-532500"
+            filing = company / "quarterly" / "2026-06-30_Results.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text(
+                "---\nnews_id: result-123\nsource_pdf: source.pdf\nextracted: ok\n---\n\n"
+                "Revenue increased during the reported quarter.",
+                encoding="utf-8",
+            )
+            record = build_document_record(company, filing)
+            output_root = root / "output"
+            claims_path = output_root / record.company_key / "claims" / claim_cache_name(record)
+            write_cached_claims(claims_path, record, [{
+                "claim_type": "business_fact",
+                "statement": "Revenue increased during the reported quarter.",
+                "metric": None,
+                "target": None,
+                "target_period": None,
+                "citation": {
+                    "document_id": record.document_id,
+                    "content_sha256": record.content_sha256,
+                    "source_pdf": record.source_pdf,
+                    "filing_date": record.filing_date,
+                    "title": record.title,
+                    "heading": "Results",
+                    "quote": "Revenue increased during the reported quarter.",
+                },
+            }])
+            client = FakeNvidiaClient()
+            client.json_completion = mock.Mock(side_effect=requests.ReadTimeout("synthesis timeout"))
+
+            process_company(
+                record.company_key,
+                [record],
+                {record.document_id: filing},
+                output_root,
+                None,
+                client,
+                0,
+                12_000,
+                8,
+            )
+
+            company_output = output_root / record.company_key
+            self.assertTrue((company_output / "research.json").exists())
+            self.assertTrue((company_output / "published.json").exists())
+            publication = json.loads((company_output / "publication-status.json").read_text(encoding="utf-8"))
+            self.assertEqual(publication["status"], "published")
+            self.assertIn("Evidence-only fallback was used", publication["warnings"])
+
     def test_company_specs_can_pin_ambiguous_names_to_bse_scrip_code(self):
         self.assertEqual(parse_company_spec("Maruti Suzuki India|532500"), ("Maruti Suzuki India", "532500"))
         self.assertEqual(parse_company_spec("SHILPAMED"), ("SHILPAMED", None))
@@ -748,14 +800,13 @@ class FilingForgePocTests(unittest.TestCase):
             self.assertEqual(
                 client.requests[1],
                 {
-                    "max_tokens": 32768,
+                    "max_tokens": 8192,
                     "model": "nvidia/test-synthesis",
                     "timeout_seconds": 1,
                     "temperature": 0.2,
                     "top_p": 0.95,
-                    "enable_thinking": True,
-                    "reasoning_budget": 8192,
-                    "stream": True,
+                    "enable_thinking": False,
+                    "stream": False,
                 },
             )
             self.assertEqual(research["overview"]["sections"][0]["heading"], "Business model")

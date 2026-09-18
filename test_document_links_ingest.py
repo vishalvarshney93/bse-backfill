@@ -137,6 +137,27 @@ class DocumentLinkIngestTests(unittest.TestCase):
         self.assertIn(f"source_pdf: {resolved_url}", markdown)
         self.assertIn("Revenue and operating margin improved", markdown)
 
+    def test_deterministic_evidence_cache_bypasses_extraction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            company = root / "library" / "ISSUER-500001"
+            filing = company / "quarterly" / "2026" / "2026-06-30__direct-doc.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text(
+                "---\nnews_id: direct-doc\nsource_pdf: https://issuer.example/report.pdf\n"
+                "extracted: ok\n---\n\n# Results\n\nRevenue and margins improved during the quarter.",
+                encoding="utf-8",
+            )
+            records, paths = ingest.discover_documents(root / "library")
+            seeded = ingest.seed_deterministic_evidence_caches(
+                "ISSUER-500001", records, paths, root / "output",
+            )
+            cache_path = root / "output" / "ISSUER-500001" / "claims" / ingest.claim_cache_name(records[0])
+            cached = ingest.load_cached_claims(cache_path, records[0])
+            self.assertEqual(seeded, 1)
+            self.assertTrue(cached)
+            self.assertEqual(cached[0]["citation"]["document_id"], records[0].document_id)
+
 
 if __name__ == "__main__":
     unittest.main()
