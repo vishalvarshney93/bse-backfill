@@ -792,7 +792,10 @@ class NvidiaClient:
         self.base_url = os.environ.get(
             "NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1"
         ).rstrip("/")
-        self.extraction_timeout = float(os.environ.get("NVIDIA_NIM_EXTRACTION_TIMEOUT_SECONDS", "60"))
+        self.extraction_timeout = max(
+            30.0,
+            min(float(os.environ.get("NVIDIA_NIM_EXTRACTION_TIMEOUT_SECONDS", "180")), 360.0),
+        )
         self.synthesis_timeout = float(os.environ.get("NVIDIA_NIM_SYNTHESIS_TIMEOUT_SECONDS", "180"))
         if not self.api_key:
             raise RuntimeError("NVIDIA_NIM_API_KEY is required unless --skip-analysis is used")

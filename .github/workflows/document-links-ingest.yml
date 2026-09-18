@@ -36,6 +36,7 @@ jobs:
       NVIDIA_NIM_MODEL: ${{ vars.FILINGFORGE_SYNTHESIS_MODEL || 'nvidia/nemotron-3-super-120b-a12b' }}
       NVIDIA_NIM_EXTRACTION_MODEL: ${{ vars.FILINGFORGE_EXTRACTION_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b' }}
       NVIDIA_NIM_EMBEDDING_MODEL: ${{ vars.FILINGFORGE_EMBEDDING_MODEL || 'nvidia/nemotron-3-embed-1b' }}
+      NVIDIA_NIM_EXTRACTION_TIMEOUT_SECONDS: "180"
       RESEARCH_ANALYST_HANDBOOK: research_analyst_grounding.md
 
     steps:
