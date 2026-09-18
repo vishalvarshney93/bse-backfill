@@ -31,7 +31,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
 from azure.identity import AzureCliCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 
@@ -1374,6 +1374,21 @@ def build_deterministic_research(claims: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def normalize_research_schema_aliases(research: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(research)
+    for collection in ("management_guidance", "walk_the_talk"):
+        normalized_items = []
+        for item in normalized.get(collection, []):
+            if not isinstance(item, dict):
+                continue
+            normalized_item = dict(item)
+            if not normalized_item.get("guidance_id") and normalized_item.get("guid_id"):
+                normalized_item["guidance_id"] = normalized_item.pop("guid_id")
+            normalized_items.append(normalized_item)
+        normalized[collection] = normalized_items
+    return normalized
+
+
 def build_manifest(
     company_key: str,
     records: list[DocumentRecord],
@@ -1813,7 +1828,9 @@ def process_company(
             used_fallback = False
             try:
                 try:
-                    research = synthesize_company_research(nvidia, company_key, synthesis_claims)
+                    research = normalize_research_schema_aliases(
+                        synthesize_company_research(nvidia, company_key, synthesis_claims)
+                    )
                 except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
                     used_fallback = True
                     failure_messages.append(f"synthesis: {type(exc).__name__}: {str(exc)[:240]}")
@@ -1832,10 +1849,10 @@ def process_company(
                     "research": research,
                     "evidence": synthesis_claims,
                 }
-                validate_snapshot(snapshot)
                 try:
+                    validate_snapshot(snapshot)
                     projection = build_published_projection(snapshot)
-                except SnapshotPublicationError as exc:
+                except (SnapshotPublicationError, ValidationError) as exc:
                     if used_fallback:
                         raise
                     used_fallback = True
@@ -1868,7 +1885,7 @@ def process_company(
                 if store:
                     store.upload_snapshot(company_key, snapshot)
                     store.publish_projection(company_key, projection, publication_status)
-            except (SnapshotPublicationError, ValueError) as exc:
+            except (SnapshotPublicationError, ValidationError, ValueError) as exc:
                 snapshot = None
                 failure_messages.append(f"publication: {type(exc).__name__}: {str(exc)[:240]}")
                 log.warning("%s: evidence-only publication unavailable: %s", company_key, exc)

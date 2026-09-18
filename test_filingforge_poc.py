@@ -32,6 +32,7 @@ from filingforge_poc import (
     parse_company_spec,
     parse_args,
     process_company,
+    normalize_research_schema_aliases,
     resolve_company_spec,
     select_research_documents,
     select_synthesis_claims,
@@ -394,6 +395,15 @@ class FakeReadableTableClient:
 
 
 class FilingForgePocTests(unittest.TestCase):
+    def test_normalizes_generated_guidance_id_alias(self):
+        normalized = normalize_research_schema_aliases({
+            "management_guidance": [{"guid_id": "G3", "statement": "Target", "document_ids": ["ff-" + "a" * 24]}],
+            "walk_the_talk": [{"guid_id": "G3", "status": "pending", "assessment": "Pending", "guidance_document_ids": ["ff-" + "a" * 24], "outcome_document_ids": []}],
+        })
+        self.assertEqual(normalized["management_guidance"][0]["guidance_id"], "G3")
+        self.assertNotIn("guid_id", normalized["management_guidance"][0])
+        self.assertEqual(normalized["walk_the_talk"][0]["guidance_id"], "G3")
+
     def test_embedding_passages_are_bounded_and_claim_aware(self):
         record = type("Record", (), {
             "document_id": "ff-" + "a" * 24,

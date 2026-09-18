@@ -665,6 +665,7 @@ def main() -> int:
                     )
             except Exception as exc:
                 failures.append(key)
+                log.exception("Ask AI ingestion failed for %s", key)
                 if not args.prepare_only:
                     record_direct_state(
                         store, key, all_documents, "error", f"processing failed: {type(exc).__name__}: {exc}",
@@ -674,6 +675,8 @@ def main() -> int:
                     )
         finally:
             release_company_lease(store, key)
+    if failures:
+        print(f"Ask AI ingestion failed for: {', '.join(failures)}")
     return 1 if failures else 0
 
 
