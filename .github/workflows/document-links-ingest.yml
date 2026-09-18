@@ -1,0 +1,70 @@
+name: Document Links Research Ingestion
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Companies to process (1-10)"
+        required: true
+        default: "1"
+        type: string
+      run_ai_analysis:
+        description: "Extract cited evidence and build the NVIDIA shadow embedding index"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: document-links-research-ingestion
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
+      SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+      NVIDIA_NIM_MODEL: ${{ vars.FILINGFORGE_SYNTHESIS_MODEL || 'nvidia/nemotron-3-super-120b-a12b' }}
+      NVIDIA_NIM_EXTRACTION_MODEL: ${{ vars.FILINGFORGE_EXTRACTION_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b' }}
+      NVIDIA_NIM_EMBEDDING_MODEL: ${{ vars.FILINGFORGE_EMBEDDING_MODEL || 'nvidia/nemotron-3-embed-1b' }}
+      RESEARCH_ANALYST_HANDBOOK: research_analyst_grounding.md
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-filingforge-poc.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-filingforge-poc.txt
+
+      - name: Run offline contract tests
+        run: python test_document_links_ingest.py
+
+      - name: Sign in to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ingest document-link batch
+        shell: bash
+        run: |
+          args=(--batch-size "${{ inputs.batch_size || '1' }}" --seed-from-azure)
+          if [[ "${{ github.event_name == 'schedule' || inputs.run_ai_analysis }}" != "true" ]]; then
+            args+=(--skip-analysis)
+          fi
+          python document_links_ingest.py "${args[@]}"

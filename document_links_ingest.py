@@ -1,0 +1,390 @@
+"""Ingest the existing SignalFeed document archive into the research corpus.
+
+This deliberately skips FilingForge discovery: `company_documents` is the
+approved document queue. PDFs are transient runner inputs; only Markdown and
+the existing evidence/retrieval artifacts are published.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import socket
+import tempfile
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import fitz
+import requests
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.data.tables import UpdateMode
+
+from filingforge_poc import (
+    AzureStore,
+    NvidiaClient,
+    discover_documents,
+    process_company,
+    upload_prepared_company,
+    utc_now,
+)
+
+
+DOCUMENT_TYPES = {
+    "ANNUAL_REPORT": "annual-reports",
+    "QUARTERLY_RESULT": "quarterly",
+    "INVESTOR_PRESENTATION": "investor-ppts",
+    "EARNINGS_TRANSCRIPT": "concalls",
+}
+STATE_PARTITION = "DOCUMENT_LINKS"
+LEASE_PARTITION = "DOCUMENT_LINKS_LEASE"
+SCRIP_PATTERN = re.compile(r"^\d{6}$")
+MAX_PDF_BYTES = 40 * 1024 * 1024
+MIN_EXTRACTED_CHARS = 200
+
+
+def public_document_url(value: str) -> str:
+    """Validate a curated source URL before the runner requests it."""
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("document URL must be a credential-free HTTPS URL")
+    if parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("document URL must not target localhost")
+    return parsed.geturl()
+
+
+def requestable_document_url(value: str) -> str:
+    url = public_document_url(value)
+    hostname = urlparse(url).hostname
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise ValueError("document URL host could not be resolved") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("document URL host resolves to a non-public address")
+    return url
+
+
+def company_key(document: dict[str, Any]) -> str:
+    scrip_code = str(document.get("scrip_code") or "").strip()
+    if not SCRIP_PATTERN.fullmatch(scrip_code):
+        raise ValueError("document has an invalid BSE scrip code")
+    name = re.sub(r"[^A-Z0-9&-]+", "-", str(document.get("company_name") or "BSE").upper()).strip("-")
+    return f"{name[:60] or 'BSE'}-{scrip_code}"
+
+
+def source_set_hash(documents: list[dict[str, Any]]) -> str:
+    values = [
+        "|".join((str(row.get("id") or ""), str(row.get("pdf_url") or "")))
+        for row in sorted(documents, key=lambda row: str(row.get("id") or ""))
+    ]
+    return hashlib.sha256("\n".join(values).encode("utf-8")).hexdigest()
+
+
+def fetch_documents() -> list[dict[str, Any]]:
+    base_url = os.environ.get("SUPABASE_URL", os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")).rstrip("/")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not base_url or not service_key:
+        raise RuntimeError("SUPABASE_URL/NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}"}
+    select = "id,scrip_code,company_name,doc_type,doc_period_end_date,pdf_url"
+    encoded_types = ",".join(quote(value) for value in sorted(DOCUMENT_TYPES))
+    result: list[dict[str, Any]] = []
+    for offset in range(0, 200_000, 1000):
+        response = requests.get(
+            f"{base_url}/rest/v1/company_documents",
+            params={"select": select, "doc_type": f"in.({encoded_types})", "order": "scrip_code.asc,id.asc", "offset": offset, "limit": 1000},
+            headers=headers,
+            timeout=45,
+        )
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("company_documents returned an unexpected response")
+        result.extend(row for row in page if isinstance(row, dict))
+        if len(page) < 1000:
+            return result
+    raise RuntimeError("company_documents pagination exceeded the safety limit")
+
+
+def group_documents(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("doc_type") not in DOCUMENT_TYPES:
+            continue
+        try:
+            grouped[company_key(row)].append(row)
+        except ValueError:
+            continue
+    return dict(grouped)
+
+
+def select_companies(
+    grouped: dict[str, list[dict[str, Any]]], state_rows: list[dict[str, Any]], batch_size: int, now: datetime | None = None,
+) -> list[str]:
+    prior = {str(row.get("RowKey")): row for row in state_rows}
+    candidates: list[str] = []
+    for key in grouped:
+        state = prior.get(key)
+        if not state or state.get("Status") not in {"enabled", "not_enabled"}:
+            candidates.append(key)
+    return sorted(candidates)[:batch_size]
+
+
+def markdown_from_pdf(document: dict[str, Any], content: bytes) -> str:
+    if not content.startswith(b"%PDF-"):
+        raise ValueError("response is not a PDF")
+    if len(content) > MAX_PDF_BYTES:
+        raise ValueError("PDF exceeds size limit")
+    pdf = fitz.open(stream=content, filetype="pdf")
+    try:
+        pages = [page.get_text("text").replace("\x00", "").strip() for page in pdf]
+    finally:
+        pdf.close()
+    text = "\n\n".join(page for page in pages if page)
+    if len(text) < MIN_EXTRACTED_CHARS:
+        raise ValueError("PDF text extraction was too thin")
+    title = re.sub(r"\s+", " ", str(document.get("company_name") or document["scrip_code"])).strip()
+    period = str(document.get("doc_period_end_date") or "unknown")
+    return (
+        "---\n"
+        f"news_id: direct-{document['id']}\n"
+        f"source_pdf: {public_document_url(str(document['pdf_url']))}\n"
+        f"document_type: {document['doc_type']}\n"
+        f"period_end_date: {period}\n"
+        "extracted: complete\n"
+        "---\n\n"
+        f"# {title} {document['doc_type'].replace('_', ' ').title()} ({period})\n\n{text}\n"
+    )
+
+
+def download_markdown(document: dict[str, Any]) -> str:
+    source_url = requestable_document_url(str(document.get("pdf_url") or ""))
+    for _ in range(4):
+        response = requests.get(source_url, timeout=(10, 90), allow_redirects=False, headers={"User-Agent": "TickerVectorResearch/1.0"})
+        if not response.is_redirect:
+            response.raise_for_status()
+            break
+        location = response.headers.get("Location")
+        if not location:
+            raise ValueError("redirect response is missing a location")
+        source_url = requestable_document_url(requests.compat.urljoin(source_url, location))
+    else:
+        raise ValueError("document URL redirected too many times")
+    return markdown_from_pdf(document, response.content)
+
+
+def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Path) -> list[str]:
+    errors: list[str] = []
+    for document in documents:
+        category = DOCUMENT_TYPES[str(document["doc_type"])]
+        period = str(document.get("doc_period_end_date") or "undated")
+        destination = library_root / key / category / period[:4] / f"{period}__direct-{document['id']}.md"
+        try:
+            markdown = download_markdown(document)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists() or destination.read_text(encoding="utf-8") != markdown:
+                destination.write_text(markdown, encoding="utf-8")
+        except Exception as exc:
+            errors.append(f"{document['id']}: {type(exc).__name__}")
+    return errors
+
+
+def state_rows(store: AzureStore) -> list[dict[str, Any]]:
+    return list(store.state.query_entities(f"PartitionKey eq '{STATE_PARTITION}'"))
+
+
+def record_direct_state(
+    store: AzureStore,
+    key: str,
+    documents: list[dict[str, Any]],
+    status: str,
+    detail: str,
+    usable_count: int = 0,
+    unavailable_count: int = 0,
+) -> None:
+    store.state.upsert_entity({
+        "PartitionKey": STATE_PARTITION,
+        "RowKey": key,
+        "Status": status,
+        "AskAiEnabled": status == "enabled",
+        "DocumentCount": len(documents),
+        "UsableDocumentCount": usable_count,
+        "UnavailableDocumentCount": unavailable_count,
+        "SourceSetHash": source_set_hash(documents),
+        "UpdatedAt": utc_now(),
+        "Detail": detail[:1000],
+    }, mode=UpdateMode.MERGE)
+
+
+def initialize_company_audit(store: AzureStore, grouped: dict[str, list[dict[str, Any]]], existing: list[dict[str, Any]]) -> None:
+    known = {str(row.get("RowKey") or "") for row in existing}
+    pending = []
+    for key, documents in sorted(grouped.items()):
+        if key in known:
+            continue
+        pending.append(("create", {
+            "PartitionKey": STATE_PARTITION,
+            "RowKey": key,
+            "Status": "pending",
+            "AskAiEnabled": False,
+            "DocumentCount": len(documents),
+            "UsableDocumentCount": 0,
+            "UnavailableDocumentCount": 0,
+            "SourceSetHash": source_set_hash(documents),
+            "UpdatedAt": utc_now(),
+            "Detail": "awaiting Ask AI enablement",
+        }))
+    for start in range(0, len(pending), 100):
+        store.state.submit_transaction(pending[start:start + 100])
+
+
+def record_unavailable_documents(store: AzureStore, documents: list[dict[str, Any]], errors: list[str]) -> None:
+    failed_ids = {error.split(":", 1)[0] for error in errors}
+    for document in documents:
+        document_id = str(document.get("id") or "")
+        if document_id not in failed_ids:
+            continue
+        store.state.upsert_entity({
+            "PartitionKey": STATE_PARTITION,
+            "RowKey": f"DOCUMENT|{document_id}",
+            "Status": "unavailable",
+            "SourceUrl": str(document.get("pdf_url") or "")[:1000],
+            "UpdatedAt": utc_now(),
+        }, mode=UpdateMode.MERGE)
+
+
+def available_documents(documents: list[dict[str, Any]], state_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unavailable = {
+        str(row.get("RowKey"))[9:]
+        for row in state_rows
+        if str(row.get("RowKey") or "").startswith("DOCUMENT|") and row.get("Status") == "unavailable"
+    }
+    return [document for document in documents if str(document.get("id") or "") not in unavailable]
+
+
+def claim_company_lease(store: AzureStore, key: str) -> bool:
+    try:
+        store.state.create_entity({
+            "PartitionKey": LEASE_PARTITION,
+            "RowKey": key,
+            "ClaimedAt": utc_now(),
+        })
+        return True
+    except ResourceExistsError:
+        return False
+
+
+def release_company_lease(store: AzureStore, key: str) -> None:
+    try:
+        store.state.delete_entity(partition_key=LEASE_PARTITION, row_key=key)
+    except ResourceNotFoundError:
+        pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--company-keys", default="", help="Optional comma-separated company keys")
+    parser.add_argument("--library-root", default="DirectDocumentLibrary")
+    parser.add_argument("--output-root", default="direct-document-output")
+    parser.add_argument("--skip-analysis", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--upload-only", action="store_true")
+    parser.add_argument("--seed-from-azure", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.prepare_only and args.upload_only:
+        raise SystemExit("--prepare-only and --upload-only cannot be combined")
+    if not 1 <= args.batch_size <= 10:
+        raise SystemExit("--batch-size must be between 1 and 10")
+    library_root = Path(args.library_root).resolve()
+    output_root = Path(args.output_root).resolve()
+    library_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    store = AzureStore()
+
+    if args.upload_only:
+        records, paths = discover_documents(library_root)
+        for key in sorted({record.company_key for record in records}):
+            upload_prepared_company(key, records, paths, output_root, store)
+        return 0
+
+    all_grouped = group_documents(fetch_documents())
+    existing_state = state_rows(store)
+    initialize_company_audit(store, all_grouped, existing_state)
+    grouped = {key: available_documents(documents, existing_state) for key, documents in all_grouped.items()}
+    selected = [key for key in args.company_keys.split(",") if key] or select_companies(grouped, existing_state, args.batch_size)
+    if not selected:
+        print("No document-link companies require ingestion")
+        return 0
+    nvidia = None if args.skip_analysis else NvidiaClient()
+    failures = []
+    for key in selected:
+        documents = grouped.get(key)
+        all_documents = all_grouped.get(key)
+        if all_documents is None:
+            failures.append(key)
+            continue
+        if not documents:
+            record_direct_state(
+                store, key, all_documents, "not_enabled", "all stored document links are unavailable",
+                usable_count=0, unavailable_count=len(all_documents),
+            )
+            continue
+        if not claim_company_lease(store, key):
+            print(f"Skipping {key}: already leased by another ingestion run")
+            continue
+        try:
+            record_direct_state(
+                store, key, all_documents, "processing", "downloading stored document links",
+                unavailable_count=len(all_documents) - len(documents),
+            )
+            if args.seed_from_azure:
+                store.hydrate_company_library(key, library_root / key, output_root / key / "claims")
+            errors = prepare_company(key, documents, library_root)
+            record_unavailable_documents(store, documents, errors)
+            records, paths = discover_documents(library_root)
+            successful_documents = [
+                document for document in documents
+                if str(document.get("id") or "") not in {error.split(":", 1)[0] for error in errors}
+            ]
+            if not successful_documents:
+                record_direct_state(
+                    store, key, all_documents, "not_enabled", "; ".join(errors),
+                    usable_count=0, unavailable_count=len(all_documents),
+                )
+                continue
+            try:
+                process_company(key, records, paths, output_root, None, nvidia, 25, 12_000, 0)
+                if not args.prepare_only:
+                    upload_prepared_company(key, records, paths, output_root, store)
+                    record_direct_state(
+                        store, key, all_documents, "enabled", "; ".join(errors) or "ok",
+                        usable_count=len(successful_documents),
+                        unavailable_count=len(all_documents) - len(successful_documents),
+                    )
+            except Exception as exc:
+                failures.append(key)
+                if not args.prepare_only:
+                    record_direct_state(
+                        store, key, all_documents, "error", f"processing failed: {type(exc).__name__}: {exc}",
+                        usable_count=len(successful_documents),
+                        unavailable_count=len(all_documents) - len(successful_documents),
+                    )
+        finally:
+            release_company_lease(store, key)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

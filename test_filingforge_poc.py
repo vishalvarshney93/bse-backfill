@@ -17,6 +17,7 @@ from filingforge_poc import (
     NvidiaRequestError,
     SnapshotPublicationError,
     build_document_record,
+    build_document_embedding_passages,
     build_document_embedding_index,
     build_manifest,
     build_markdown_packs,
@@ -393,6 +394,37 @@ class FakeReadableTableClient:
 
 
 class FilingForgePocTests(unittest.TestCase):
+    def test_embedding_passages_are_bounded_and_claim_aware(self):
+        record = type("Record", (), {
+            "document_id": "ff-" + "a" * 24,
+            "content_sha256": "b" * 64,
+            "title": "Annual Report",
+            "category": "annual-reports",
+            "filing_date": "2026-03-31",
+        })()
+        claims = []
+        for index in range(6):
+            text = f"claim-{index}-" + "x" * 1500
+            claims.append({
+                "claim_type": "business_fact",
+                "statement": text,
+                "citation": {
+                    "document_id": record.document_id,
+                    "heading": "Operations",
+                    "quote": text,
+                },
+            })
+        passages = build_document_embedding_passages([record], claims)
+        self.assertGreater(len(passages), 1)
+        self.assertTrue(all(len(item["text"]) <= 4500 for item in passages))
+        self.assertEqual(
+            [item["chunk_index"] for item in passages],
+            list(range(len(passages))),
+        )
+        for index in range(1, len(passages)):
+            self.assertIn(f"claim-{index - 1}-", passages[index]["text"])
+            self.assertIn(f"claim-{index}-", passages[index]["text"])
+
     def test_cli_accepts_six_month_window(self):
         with mock.patch.object(sys, "argv", ["filingforge_poc.py", "--years", "0.5"]):
             self.assertEqual(parse_args().years, 0.5)

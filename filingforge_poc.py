@@ -80,6 +80,7 @@ DEFAULT_EXTRACTION_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b"
 EMBEDDING_DIMENSIONS = 2048
 EMBEDDING_BATCH_SIZE = 8
+EMBEDDING_PASSAGE_TARGET_CHARS = 4_000
 MAX_ANALYST_HANDBOOK_CHARS = 32_000
 
 
@@ -1070,27 +1071,43 @@ def build_document_embedding_passages(
         document_claims = claims_by_document.get(record.document_id, [])
         if not document_claims:
             continue
-        lines = [
+        header = [
             f"Title: {record.title}",
             f"Category: {record.category}",
             f"Filing date: {record.filing_date or 'unknown'}",
         ]
+        claim_lines = []
         for claim in document_claims:
             citation = claim.get("citation", {})
-            lines.append(" | ".join(filter(None, (
-                str(claim.get("claim_type") or ""),
-                str(claim.get("statement") or ""),
-                str(citation.get("heading") or ""),
-                str(citation.get("quote") or ""),
+            claim_lines.append(" | ".join(filter(None, (
+                str(claim.get("claim_type") or "")[:100],
+                str(claim.get("statement") or "")[:1_600],
+                str(citation.get("heading") or "")[:400],
+                str(citation.get("quote") or "")[:1_800],
             ))))
-        text = "\n".join(lines)[:120_000]
-        passages.append({
-            "document_id": record.document_id,
-            "content_sha256": record.content_sha256,
-            "passage_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "claim_count": len(document_claims),
-            "text": text,
-        })
+        pending: list[str] = []
+        document_passages = []
+        for line in claim_lines:
+            candidate = "\n".join(header + pending + [line])
+            if pending and len(candidate) > EMBEDDING_PASSAGE_TARGET_CHARS:
+                document_passages.append(pending)
+                overlap = pending[-1]
+                if len(overlap) > 400:
+                    overlap = f"{overlap[:200]} ... {overlap[-200:]}"
+                pending = [overlap]
+            pending.append(line)
+        if pending:
+            document_passages.append(pending)
+        for chunk_index, chunk_lines in enumerate(document_passages):
+            text = "\n".join(header + chunk_lines)
+            passages.append({
+                "document_id": record.document_id,
+                "content_sha256": record.content_sha256,
+                "passage_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "chunk_index": chunk_index,
+                "claim_count": len(chunk_lines),
+                "text": text,
+            })
     return passages
 
 
@@ -1127,9 +1144,13 @@ def build_document_embedding_index(
                 and len(existing_vectors) == len(candidate.get("documents", [])) * EMBEDDING_DIMENSIONS
             ):
                 existing_metadata = {
-                    item["document_id"]: item
+                    (item["document_id"], item["passage_sha256"]): item
                     for item in candidate.get("documents", [])
-                    if isinstance(item, dict) and isinstance(item.get("vector_index"), int)
+                    if (
+                        isinstance(item, dict)
+                        and isinstance(item.get("passage_sha256"), str)
+                        and isinstance(item.get("vector_index"), int)
+                    )
                 }
             else:
                 existing_vectors = array("f")
@@ -1138,19 +1159,16 @@ def build_document_embedding_index(
             existing_vectors = array("f")
 
     passages = build_document_embedding_passages(records, claims)
-    vectors_by_document: dict[str, list[float]] = {}
+    vectors_by_passage: dict[tuple[str, str], list[float]] = {}
     missing = []
     for passage in passages:
-        cached = existing_metadata.get(passage["document_id"])
-        if (
-            cached
-            and cached.get("content_sha256") == passage["content_sha256"]
-            and cached.get("passage_sha256") == passage["passage_sha256"]
-        ):
+        passage_key = (passage["document_id"], passage["passage_sha256"])
+        cached = existing_metadata.get(passage_key)
+        if cached:
             start = cached["vector_index"] * EMBEDDING_DIMENSIONS
             vector = list(existing_vectors[start:start + EMBEDDING_DIMENSIONS])
             if len(vector) == EMBEDDING_DIMENSIONS:
-                vectors_by_document[passage["document_id"]] = vector
+                vectors_by_passage[passage_key] = vector
                 continue
         missing.append(passage)
 
@@ -1160,18 +1178,21 @@ def build_document_embedding_index(
         if len(embedded) != len(batch):
             raise NvidiaResponseError("Embedding response count does not match input count")
         for passage, values in zip(batch, embedded):
-            vectors_by_document[passage["document_id"]] = _normalized_embedding(values)
+            passage_key = (passage["document_id"], passage["passage_sha256"])
+            vectors_by_passage[passage_key] = _normalized_embedding(values)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     packed_vectors = array("f")
     documents = []
     for passage in passages:
         vector_index = len(documents)
-        packed_vectors.extend(vectors_by_document[passage["document_id"]])
+        passage_key = (passage["document_id"], passage["passage_sha256"])
+        packed_vectors.extend(vectors_by_passage[passage_key])
         documents.append({
             "document_id": passage["document_id"],
             "content_sha256": passage["content_sha256"],
             "passage_sha256": passage["passage_sha256"],
+            "chunk_index": passage["chunk_index"],
             "claim_count": passage["claim_count"],
             "vector_index": vector_index,
         })
@@ -1182,6 +1203,7 @@ def build_document_embedding_index(
         "model": client.embedding_model,
         "dimensions": EMBEDDING_DIMENSIONS,
         "encoding": "float32_le_l2_normalized",
+        "logical_document_count": len({item["document_id"] for item in documents}),
         "document_count": len(documents),
         "documents": documents,
     }
@@ -1361,8 +1383,9 @@ def _source_pdf_is_safe(value: str | None) -> bool:
     if parsed.scheme:
         return bool(
             parsed.scheme == "https"
-            and (parsed.hostname or "").lower() in {"bseindia.com", "www.bseindia.com"}
-            and SAFE_SOURCE_PDF_PATTERN.fullmatch(Path(parsed.path).name)
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
         )
     return bool("/" not in value and "\\" not in value and SAFE_SOURCE_PDF_PATTERN.fullmatch(value))
 
