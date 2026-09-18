@@ -19,6 +19,7 @@ import sys
 import tempfile
 import urllib.parse
 from array import array
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,7 @@ DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b"
 EMBEDDING_DIMENSIONS = 2048
 EMBEDDING_BATCH_SIZE = 8
 EMBEDDING_PASSAGE_TARGET_CHARS = 4_000
+EXTRACTION_MAX_WORKERS = max(1, min(int(os.environ.get("NVIDIA_NIM_EXTRACTION_WORKERS", "3")), 4))
 MAX_ANALYST_HANDBOOK_CHARS = 32_000
 
 
@@ -1219,7 +1221,7 @@ def extract_supported_claims(
     client: NvidiaClient, record: DocumentRecord, source: str, source_offset: int = 0
 ) -> list[dict[str, Any]]:
     system = """You extract auditable equity-research evidence from one official company filing.
-Return JSON only. Do not infer missing numbers or dates. Every claim must contain a short verbatim quote
+Return JSON only with at most 12 high-value, non-duplicative claims. Do not infer missing numbers or dates. Every claim must contain a short verbatim quote
 copied from SOURCE. Allowed claim_type values: business_fact, positive, risk, guidance, outcome.
 Guidance means a forward-looking management promise, target, milestone or expectation. Outcome means
 later evidence about delivery. Use null for unknown metric/target/target_period."""
@@ -1234,7 +1236,8 @@ SOURCE:
 
 Return:
 {{"claims":[{{"claim_type":"guidance","statement":"...","metric":null,"target":null,
-"target_period":null,"quote":"exact source text","heading":null}}]}}"""
+"target_period":null,"quote":"exact source text","heading":null}}]}}
+Return no more than 12 claims and no prose outside the JSON object."""
     result = client.json_completion(
         system,
         user,
@@ -1658,26 +1661,38 @@ def process_company(
                 continue
             attempted_documents += 1
             markdown = paths[record.document_id].read_text(encoding="utf-8", errors="replace")
-            document_claims: list[dict[str, Any]] = []
+            document_claims_by_offset: dict[int, list[dict[str, Any]]] = {}
             document_failed = False
-            for source_offset, source in document_windows(
+            windows = document_windows(
                 markdown, max_chars_per_document, max_windows_per_document
-            ):
-                try:
-                    document_claims.extend(extract_supported_claims(nvidia, record, source, source_offset))
-                except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
-                    failed_windows += 1
-                    document_failed = True
-                    failure_messages.append(
-                        f"{record.document_id}@{source_offset}: {type(exc).__name__}: {str(exc)[:240]}"
-                    )
-                    log.warning(
-                        "%s: skipping timed-out/invalid NVIDIA window %s@%d: %s",
-                        company_key,
-                        record.document_id,
-                        source_offset,
-                        exc,
-                    )
+            )
+            with ThreadPoolExecutor(max_workers=min(EXTRACTION_MAX_WORKERS, max(len(windows), 1))) as executor:
+                pending_windows = {
+                    executor.submit(extract_supported_claims, nvidia, record, source, source_offset): source_offset
+                    for source_offset, source in windows
+                }
+                for future in as_completed(pending_windows):
+                    source_offset = pending_windows[future]
+                    try:
+                        document_claims_by_offset[source_offset] = future.result()
+                    except (requests.RequestException, NvidiaResponseError, ValueError) as exc:
+                        failed_windows += 1
+                        document_failed = True
+                        failure_messages.append(
+                            f"{record.document_id}@{source_offset}: {type(exc).__name__}: {str(exc)[:240]}"
+                        )
+                        log.warning(
+                            "%s: skipping timed-out/invalid NVIDIA window %s@%d: %s",
+                            company_key,
+                            record.document_id,
+                            source_offset,
+                            exc,
+                        )
+            document_claims = [
+                claim
+                for source_offset in sorted(document_claims_by_offset)
+                for claim in document_claims_by_offset[source_offset]
+            ]
             claims.extend(document_claims)
             if not document_failed:
                 write_cached_claims(cache_path, record, document_claims)

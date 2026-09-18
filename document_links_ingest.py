@@ -52,6 +52,14 @@ SCRIP_PATTERN = re.compile(r"^\d{6}$")
 MAX_PDF_BYTES = 40 * 1024 * 1024
 MIN_EXTRACTED_CHARS = 200
 SPARSE_PAGE_CHAR_THRESHOLD = 30
+ANALYSIS_WINDOW_CHARS = max(
+    4_000,
+    min(int(os.environ.get("NVIDIA_NIM_ANALYSIS_WINDOW_CHARS", "12000")), 24_000),
+)
+MAX_WINDOWS_PER_DOCUMENT = max(
+    1,
+    min(int(os.environ.get("NVIDIA_NIM_MAX_WINDOWS_PER_DOCUMENT", "8")), 16),
+)
 log = logging.getLogger("document_links_ingest")
 
 
@@ -554,7 +562,17 @@ def main() -> int:
                 )
                 continue
             try:
-                process_company(key, records, paths, output_root, None, nvidia, 0, 12_000, 0)
+                process_company(
+                    key,
+                    records,
+                    paths,
+                    output_root,
+                    None,
+                    nvidia,
+                    0,
+                    ANALYSIS_WINDOW_CHARS,
+                    MAX_WINDOWS_PER_DOCUMENT,
+                )
                 if not args.prepare_only:
                     published = upload_prepared_company(key, records, paths, output_root, store)
                     if not published:
