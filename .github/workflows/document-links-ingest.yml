@@ -11,7 +11,7 @@ on:
         default: "1"
         type: string
       run_ai_analysis:
-        description: "Extract cited evidence and build the NVIDIA shadow embedding index"
+        description: "Extract cited evidence and build the NVIDIA hybrid embedding index"
         required: true
         default: true
         type: boolean
@@ -48,7 +48,10 @@ jobs:
           cache-dependency-path: requirements-filingforge-poc.txt
 
       - name: Install dependencies
-        run: pip install -r requirements-filingforge-poc.txt
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tesseract-ocr
+          pip install -r requirements-filingforge-poc.txt
 
       - name: Run offline contract tests
         run: python test_document_links_ingest.py
@@ -59,6 +62,14 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Replace legacy document redirect URLs
+        if: ${{ github.event_name == 'schedule' }}
+        run: >-
+          python document_links_ingest.py
+          --canonicalize-only
+          --canonicalize-limit 800
+          --canonicalize-delay-seconds 6.5
 
       - name: Ingest document-link batch
         shell: bash

@@ -11,11 +11,14 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
 import tempfile
+import time
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,23 @@ LEASE_PARTITION = "DOCUMENT_LINKS_LEASE"
 SCRIP_PATTERN = re.compile(r"^\d{6}$")
 MAX_PDF_BYTES = 40 * 1024 * 1024
 MIN_EXTRACTED_CHARS = 200
+SPARSE_PAGE_CHAR_THRESHOLD = 30
+log = logging.getLogger("document_links_ingest")
+
+
+class DocumentUnavailableError(ValueError):
+    pass
+
+
+class DocumentExtractionError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class DocumentFailure:
+    document_id: str
+    status: str
+    detail: str
 
 
 def public_document_url(value: str) -> str:
@@ -69,6 +89,14 @@ def requestable_document_url(value: str) -> str:
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise ValueError("document URL host resolves to a non-public address")
     return url
+
+
+def is_screener_document_url(value: str) -> bool:
+    try:
+        hostname = (urlparse(value).hostname or "").lower()
+        return hostname == "screener.in" or hostname.endswith(".screener.in")
+    except ValueError:
+        return False
 
 
 def company_key(document: dict[str, Any]) -> str:
@@ -113,6 +141,87 @@ def fetch_documents() -> list[dict[str, Any]]:
     raise RuntimeError("company_documents pagination exceeded the safety limit")
 
 
+def persist_resolved_document_url(document: dict[str, Any], resolved_url: str | None) -> bool:
+    original_url = str(document.get("pdf_url") or "")
+    if resolved_url == original_url:
+        return True
+    base_url = os.environ.get("SUPABASE_URL", os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")).rstrip("/")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not base_url or not service_key:
+        return False
+    try:
+        response = requests.patch(
+            f"{base_url}/rest/v1/company_documents",
+            params={"id": f"eq.{document['id']}"},
+            headers={
+                "apikey": service_key,
+                "Authorization": f"Bearer {service_key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={"pdf_url": resolved_url},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        log.warning("Could not persist resolved URL for %s: %s", document.get("id"), type(exc).__name__)
+        return False
+
+
+def resolve_stored_document_url(raw_url: str) -> str | None:
+    if not is_screener_document_url(raw_url):
+        return public_document_url(raw_url)
+    current = requestable_document_url(raw_url)
+    try:
+        for _ in range(4):
+            response = requests.get(
+                current,
+                timeout=(10, 30),
+                allow_redirects=False,
+                stream=True,
+                headers={"User-Agent": "TickerVectorDocuments/1.0"},
+            )
+            try:
+                if response.is_redirect and response.headers.get("Location"):
+                    current = requestable_document_url(requests.compat.urljoin(current, response.headers["Location"]))
+                    continue
+                response.raise_for_status()
+                return None if is_screener_document_url(current) else current
+            finally:
+                response.close()
+    except (ValueError, requests.RequestException):
+        return None
+    return None
+
+
+def canonicalize_stored_document_urls(
+    documents: list[dict[str, Any]],
+    limit: int,
+    delay_seconds: float,
+) -> tuple[int, int, int]:
+    candidates = [
+        document for document in documents
+        if is_screener_document_url(str(document.get("pdf_url") or ""))
+    ][:limit]
+    resolved = 0
+    removed = 0
+    failed = 0
+    for index, document in enumerate(candidates):
+        direct_url = resolve_stored_document_url(str(document.get("pdf_url") or ""))
+        if not persist_resolved_document_url(document, direct_url):
+            failed += 1
+            continue
+        if direct_url:
+            resolved += 1
+        else:
+            removed += 1
+        if index < len(candidates) - 1:
+            time.sleep(delay_seconds)
+    print(f"Canonicalized {resolved} direct document URL(s); removed {removed} unresolved URL(s); {failed} update(s) failed.")
+    return resolved, removed, failed
+
+
 def group_documents(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -137,25 +246,49 @@ def select_companies(
     return sorted(candidates)[:batch_size]
 
 
-def markdown_from_pdf(document: dict[str, Any], content: bytes) -> str:
+def markdown_from_pdf(
+    document: dict[str, Any],
+    content: bytes,
+    resolved_source_url: str | None = None,
+) -> str:
     if not content.startswith(b"%PDF-"):
-        raise ValueError("response is not a PDF")
+        raise DocumentExtractionError("response is not a PDF")
     if len(content) > MAX_PDF_BYTES:
-        raise ValueError("PDF exceeds size limit")
+        raise DocumentExtractionError("PDF exceeds size limit")
     pdf = fitz.open(stream=content, filetype="pdf")
     try:
         pages = [page.get_text("text").replace("\x00", "").strip() for page in pdf]
+        sparse_pages = [
+            index for index, page in enumerate(pdf)
+            if len(pages[index]) < SPARSE_PAGE_CHAR_THRESHOLD and page.get_images()
+        ]
+        if sparse_pages:
+            try:
+                import pytesseract
+                from PIL import Image
+
+                for index in sparse_pages:
+                    pixmap = pdf[index].get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False)
+                    image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                    pages[index] = pytesseract.image_to_string(image).replace("\x00", "").strip()
+                    image.close()
+            except Exception as exc:
+                if len("\n".join(pages)) < MIN_EXTRACTED_CHARS:
+                    raise DocumentExtractionError(
+                        f"PDF text extraction was too thin and OCR failed: {type(exc).__name__}: {exc}"
+                    ) from exc
     finally:
         pdf.close()
     text = "\n\n".join(page for page in pages if page)
     if len(text) < MIN_EXTRACTED_CHARS:
-        raise ValueError("PDF text extraction was too thin")
+        raise DocumentExtractionError("PDF text extraction was too thin after OCR")
     title = re.sub(r"\s+", " ", str(document.get("company_name") or document["scrip_code"])).strip()
     period = str(document.get("doc_period_end_date") or "unknown")
+    source_url = public_document_url(resolved_source_url or str(document["pdf_url"]))
     return (
         "---\n"
         f"news_id: direct-{document['id']}\n"
-        f"source_pdf: {public_document_url(str(document['pdf_url']))}\n"
+        f"source_pdf: {source_url}\n"
         f"document_type: {document['doc_type']}\n"
         f"period_end_date: {period}\n"
         "extracted: complete\n"
@@ -165,23 +298,31 @@ def markdown_from_pdf(document: dict[str, Any], content: bytes) -> str:
 
 
 def download_markdown(document: dict[str, Any]) -> str:
-    source_url = requestable_document_url(str(document.get("pdf_url") or ""))
-    for _ in range(4):
-        response = requests.get(source_url, timeout=(10, 90), allow_redirects=False, headers={"User-Agent": "TickerVectorResearch/1.0"})
-        if not response.is_redirect:
-            response.raise_for_status()
-            break
-        location = response.headers.get("Location")
-        if not location:
-            raise ValueError("redirect response is missing a location")
-        source_url = requestable_document_url(requests.compat.urljoin(source_url, location))
-    else:
-        raise ValueError("document URL redirected too many times")
-    return markdown_from_pdf(document, response.content)
+    original_url = str(document.get("pdf_url") or "")
+    try:
+        source_url = requestable_document_url(original_url)
+        for _ in range(4):
+            response = requests.get(source_url, timeout=(10, 90), allow_redirects=False, headers={"User-Agent": "TickerVectorResearch/1.0"})
+            if not response.is_redirect:
+                response.raise_for_status()
+                break
+            location = response.headers.get("Location")
+            if not location:
+                raise DocumentUnavailableError("redirect response is missing a location")
+            source_url = requestable_document_url(requests.compat.urljoin(source_url, location))
+        else:
+            raise DocumentUnavailableError("document URL redirected too many times")
+    except DocumentUnavailableError:
+        raise
+    except (ValueError, requests.RequestException) as exc:
+        raise DocumentUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+    if response.content.startswith(b"%PDF-"):
+        persist_resolved_document_url(document, source_url)
+    return markdown_from_pdf(document, response.content, source_url)
 
 
-def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Path) -> list[str]:
-    errors: list[str] = []
+def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Path) -> list[DocumentFailure]:
+    errors: list[DocumentFailure] = []
     for document in documents:
         category = DOCUMENT_TYPES[str(document["doc_type"])]
         period = str(document.get("doc_period_end_date") or "undated")
@@ -191,8 +332,12 @@ def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Pat
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists() or destination.read_text(encoding="utf-8") != markdown:
                 destination.write_text(markdown, encoding="utf-8")
+        except DocumentUnavailableError as exc:
+            errors.append(DocumentFailure(str(document["id"]), "unavailable", str(exc)))
         except Exception as exc:
-            errors.append(f"{document['id']}: {type(exc).__name__}")
+            errors.append(DocumentFailure(
+                str(document["id"]), "extraction_error", f"{type(exc).__name__}: {exc}",
+            ))
     return errors
 
 
@@ -208,6 +353,7 @@ def record_direct_state(
     detail: str,
     usable_count: int = 0,
     unavailable_count: int = 0,
+    failed_count: int = 0,
 ) -> None:
     store.state.upsert_entity({
         "PartitionKey": STATE_PARTITION,
@@ -217,6 +363,7 @@ def record_direct_state(
         "DocumentCount": len(documents),
         "UsableDocumentCount": usable_count,
         "UnavailableDocumentCount": unavailable_count,
+        "FailedDocumentCount": failed_count,
         "SourceSetHash": source_set_hash(documents),
         "UpdatedAt": utc_now(),
         "Detail": detail[:1000],
@@ -237,6 +384,7 @@ def initialize_company_audit(store: AzureStore, grouped: dict[str, list[dict[str
             "DocumentCount": len(documents),
             "UsableDocumentCount": 0,
             "UnavailableDocumentCount": 0,
+            "FailedDocumentCount": 0,
             "SourceSetHash": source_set_hash(documents),
             "UpdatedAt": utc_now(),
             "Detail": "awaiting Ask AI enablement",
@@ -245,18 +393,20 @@ def initialize_company_audit(store: AzureStore, grouped: dict[str, list[dict[str
         store.state.submit_transaction(pending[start:start + 100])
 
 
-def record_unavailable_documents(store: AzureStore, documents: list[dict[str, Any]], errors: list[str]) -> None:
-    failed_ids = {error.split(":", 1)[0] for error in errors}
+def record_document_failures(store: AzureStore, documents: list[dict[str, Any]], errors: list[DocumentFailure]) -> None:
+    failures = {error.document_id: error for error in errors}
     for document in documents:
         document_id = str(document.get("id") or "")
-        if document_id not in failed_ids:
+        failure = failures.get(document_id)
+        if failure is None:
             continue
         store.state.upsert_entity({
             "PartitionKey": STATE_PARTITION,
             "RowKey": f"DOCUMENT|{document_id}",
-            "Status": "unavailable",
+            "Status": failure.status,
             "SourceUrl": str(document.get("pdf_url") or "")[:1000],
             "UpdatedAt": utc_now(),
+            "Detail": failure.detail[:1000],
         }, mode=UpdateMode.MERGE)
 
 
@@ -298,6 +448,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--upload-only", action="store_true")
     parser.add_argument("--seed-from-azure", action="store_true")
+    parser.add_argument("--canonicalize-only", action="store_true")
+    parser.add_argument("--canonicalize-limit", type=int, default=800)
+    parser.add_argument("--canonicalize-delay-seconds", type=float, default=6.5)
     return parser.parse_args()
 
 
@@ -307,11 +460,21 @@ def main() -> int:
         raise SystemExit("--prepare-only and --upload-only cannot be combined")
     if not 1 <= args.batch_size <= 10:
         raise SystemExit("--batch-size must be between 1 and 10")
+    if not 1 <= args.canonicalize_limit <= 2000:
+        raise SystemExit("--canonicalize-limit must be between 1 and 2000")
+    if args.canonicalize_delay_seconds < 1:
+        raise SystemExit("--canonicalize-delay-seconds must be at least 1")
     library_root = Path(args.library_root).resolve()
     output_root = Path(args.output_root).resolve()
     library_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
     store = AzureStore()
+
+    if args.canonicalize_only:
+        _resolved, _removed, failed = canonicalize_stored_document_urls(
+            fetch_documents(), args.canonicalize_limit, args.canonicalize_delay_seconds,
+        )
+        return 1 if failed else 0
 
     if args.upload_only:
         records, paths = discover_documents(library_root)
@@ -338,7 +501,7 @@ def main() -> int:
         if not documents:
             record_direct_state(
                 store, key, all_documents, "not_enabled", "all stored document links are unavailable",
-                usable_count=0, unavailable_count=len(all_documents),
+                usable_count=0, unavailable_count=len(all_documents), failed_count=len(all_documents),
             )
             continue
         if not claim_company_lease(store, key):
@@ -352,16 +515,21 @@ def main() -> int:
             if args.seed_from_azure:
                 store.hydrate_company_library(key, library_root / key, output_root / key / "claims")
             errors = prepare_company(key, documents, library_root)
-            record_unavailable_documents(store, documents, errors)
+            record_document_failures(store, documents, errors)
             records, paths = discover_documents(library_root)
+            failed_ids = {error.document_id for error in errors}
             successful_documents = [
                 document for document in documents
-                if str(document.get("id") or "") not in {error.split(":", 1)[0] for error in errors}
+                if str(document.get("id") or "") not in failed_ids
             ]
+            error_detail = "; ".join(
+                f"{error.document_id}: {error.status}: {error.detail}" for error in errors
+            )
+            unavailable_count = sum(error.status == "unavailable" for error in errors)
             if not successful_documents:
                 record_direct_state(
-                    store, key, all_documents, "not_enabled", "; ".join(errors),
-                    usable_count=0, unavailable_count=len(all_documents),
+                    store, key, all_documents, "not_enabled", error_detail,
+                    usable_count=0, unavailable_count=unavailable_count, failed_count=len(errors),
                 )
                 continue
             try:
@@ -369,9 +537,10 @@ def main() -> int:
                 if not args.prepare_only:
                     upload_prepared_company(key, records, paths, output_root, store)
                     record_direct_state(
-                        store, key, all_documents, "enabled", "; ".join(errors) or "ok",
+                        store, key, all_documents, "enabled", error_detail or "ok",
                         usable_count=len(successful_documents),
-                        unavailable_count=len(all_documents) - len(successful_documents),
+                        unavailable_count=unavailable_count,
+                        failed_count=len(errors),
                     )
             except Exception as exc:
                 failures.append(key)
@@ -379,7 +548,8 @@ def main() -> int:
                     record_direct_state(
                         store, key, all_documents, "error", f"processing failed: {type(exc).__name__}: {exc}",
                         usable_count=len(successful_documents),
-                        unavailable_count=len(all_documents) - len(successful_documents),
+                        unavailable_count=unavailable_count,
+                        failed_count=len(errors),
                     )
         finally:
             release_company_lease(store, key)
