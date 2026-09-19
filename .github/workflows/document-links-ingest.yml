@@ -5,6 +5,11 @@ on:
     - cron: "2-59/6 * * * *"
   workflow_dispatch:
     inputs:
+      company_key:
+        description: "Optional exact company key to force refresh (for example 20-MICRONS-LTD-533022)"
+        required: false
+        default: ""
+        type: string
       batch_size:
         description: "Companies to process (1-10)"
         required: true
@@ -34,6 +39,7 @@ jobs:
       matrix:
         shard: ${{ fromJSON(github.event_name == 'schedule' && '[0,1]' || '[0]') }}
     env:
+      INPUT_COMPANY_KEY: ${{ inputs.company_key || '' }}
       AZURE_STORAGE_ACCOUNT: ${{ vars.FILINGFORGE_STORAGE_ACCOUNT }}
       SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -83,6 +89,9 @@ jobs:
             --shard-count "$shard_count"
             --seed-from-azure
           )
+          if [[ -n "$INPUT_COMPANY_KEY" ]]; then
+            args+=(--company-keys "$INPUT_COMPANY_KEY")
+          fi
           if [[ "${{ github.event_name == 'schedule' || inputs.run_ai_analysis }}" != "true" ]]; then
             args+=(--skip-analysis)
           fi
