@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import gzip
+import numpy as np
 import requests
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.data.tables import TableServiceClient, UpdateMode
@@ -33,6 +34,7 @@ from azure.identity import AzureCliCredential
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from usearch.index import Index as USearchIndex
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -472,7 +474,7 @@ class AzureStore:
                 )
             except ResourceNotFoundError:
                 pass
-            for retrieval_name in ("retrieval-index.json", "retrieval-vectors.f32"):
+            for retrieval_name in ("retrieval-index.json", "retrieval-vectors.f32", "retrieval-hnsw.usearch"):
                 try:
                     retrieval_data = self.snapshots.get_blob_client(
                         f"companies/{company_key}/{retrieval_name}"
@@ -617,6 +619,7 @@ class AzureStore:
         vectors_path: Path,
     ) -> None:
         scrip_code = scrip_code_from_company_key(company_key)
+        ann_path = metadata_path.with_name("retrieval-hnsw.usearch")
         for container, prefix in (
             (self.snapshots, f"companies/{company_key}"),
             (self.published, f"companies/{scrip_code}"),
@@ -633,6 +636,13 @@ class AzureStore:
                 vectors_path.read_bytes(),
                 "application/octet-stream",
             )
+            if ann_path.exists():
+                self._upload(
+                    container,
+                    f"{prefix}/retrieval-hnsw.usearch",
+                    ann_path.read_bytes(),
+                    "application/octet-stream",
+                )
 
     def cleanup_legacy_document_blobs(
         self,
@@ -1087,28 +1097,51 @@ def build_document_embedding_passages(
             f"Filing date: {record.filing_date or 'unknown'}",
         ]
         claim_lines = []
+        claim_evidence_ids = []
         for claim in document_claims:
             citation = claim.get("citation", {})
-            claim_lines.append(" | ".join(filter(None, (
+            evidence_id = str(claim.get("evidence_id") or citation.get("evidence_id") or "")
+            statement = str(claim.get("statement") or "")[:1_800]
+            quote = str(citation.get("quote") or "")[:1_800]
+            parts = [
                 str(claim.get("claim_type") or "")[:100],
-                str(claim.get("statement") or "")[:1_600],
+                statement,
                 str(citation.get("heading") or "")[:400],
-                str(citation.get("quote") or "")[:1_800],
-            ))))
+            ]
+            if normalize_text(quote) != normalize_text(statement):
+                parts.append(quote)
+            claim_lines.append(" | ".join(filter(None, parts)))
+            claim_evidence_ids.append(evidence_id)
+        if any(claim_evidence_ids):
+            for chunk_index, (line, evidence_id) in enumerate(zip(claim_lines, claim_evidence_ids)):
+                text = "\n".join(header + [line])
+                passages.append({
+                    "document_id": record.document_id,
+                    "content_sha256": record.content_sha256,
+                    "passage_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "chunk_index": chunk_index,
+                    "claim_count": 1,
+                    "evidence_ids": [evidence_id] if evidence_id else [],
+                    "text": text,
+                })
+            continue
         pending: list[str] = []
-        document_passages = []
-        for line in claim_lines:
+        pending_ids: list[str] = []
+        document_passages: list[tuple[list[str], list[str]]] = []
+        for line, evidence_id in zip(claim_lines, claim_evidence_ids):
             candidate = "\n".join(header + pending + [line])
             if pending and len(candidate) > EMBEDDING_PASSAGE_TARGET_CHARS:
-                document_passages.append(pending)
+                document_passages.append((pending, pending_ids))
                 overlap = pending[-1]
                 if len(overlap) > 400:
                     overlap = f"{overlap[:200]} ... {overlap[-200:]}"
                 pending = [overlap]
+                pending_ids = pending_ids[-1:]
             pending.append(line)
+            pending_ids.append(evidence_id)
         if pending:
-            document_passages.append(pending)
-        for chunk_index, chunk_lines in enumerate(document_passages):
+            document_passages.append((pending, pending_ids))
+        for chunk_index, (chunk_lines, evidence_ids) in enumerate(document_passages):
             text = "\n".join(header + chunk_lines)
             passages.append({
                 "document_id": record.document_id,
@@ -1116,6 +1149,7 @@ def build_document_embedding_passages(
                 "passage_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 "chunk_index": chunk_index,
                 "claim_count": len(chunk_lines),
+                "evidence_ids": list(dict.fromkeys(value for value in evidence_ids if value)),
                 "text": text,
             })
     return passages
@@ -1204,6 +1238,7 @@ def build_document_embedding_index(
             "passage_sha256": passage["passage_sha256"],
             "chunk_index": passage["chunk_index"],
             "claim_count": passage["claim_count"],
+            "evidence_ids": passage["evidence_ids"],
             "vector_index": vector_index,
         })
     metadata = {
@@ -1217,6 +1252,30 @@ def build_document_embedding_index(
         "document_count": len(documents),
         "documents": documents,
     }
+    ann_path = output_dir / "retrieval-hnsw.usearch"
+    if documents:
+        matrix = np.asarray(packed_vectors, dtype=np.float32).reshape(
+            len(documents), EMBEDDING_DIMENSIONS
+        )
+        ann_index = USearchIndex(
+            ndim=EMBEDDING_DIMENSIONS,
+            metric="cos",
+            dtype="f32",
+            connectivity=16,
+            expansion_add=128,
+            expansion_search=64,
+        )
+        ann_index.add(np.arange(len(documents), dtype=np.uint64), matrix)
+        ann_index.save(str(ann_path))
+        metadata["ann"] = {
+            "kind": "usearch_hnsw",
+            "blob_name": "retrieval-hnsw.usearch",
+            "metric": "cos",
+            "connectivity": 16,
+            "expansion_search": 64,
+        }
+    elif ann_path.exists():
+        ann_path.unlink()
     metadata_path.write_text(json.dumps(metadata, separators=(",", ":")), encoding="utf-8")
     vectors_path.write_bytes(packed_vectors.tobytes())
     return metadata_path, vectors_path, metadata

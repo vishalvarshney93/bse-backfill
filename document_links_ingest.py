@@ -52,6 +52,7 @@ DOCUMENT_TYPES = {
 STATE_PARTITION = "DOCUMENT_LINKS"
 LEASE_PARTITION = "DOCUMENT_LINKS_LEASE"
 LEASE_DURATION = timedelta(hours=6)
+CORPUS_VERSION = 2
 SCRIP_PATTERN = re.compile(r"^\d{6}$")
 MAX_PDF_BYTES = 40 * 1024 * 1024
 MIN_EXTRACTED_CHARS = 200
@@ -65,6 +66,13 @@ MAX_WINDOWS_PER_DOCUMENT = max(
     min(int(os.environ.get("NVIDIA_NIM_MAX_WINDOWS_PER_DOCUMENT", "8")), 16),
 )
 EVIDENCE_PASSAGE_CHARS = 1_800
+EVIDENCE_PASSAGE_OVERLAP_CHARS = 240
+MAX_EVIDENCE_PASSAGES_PER_DOCUMENT = 2_000
+MAX_TABLES_PER_DOCUMENT = 80
+TABLE_PAGE_PATTERN = re.compile(
+    r"\b(?:particulars|revenue|sales|profit|margin|segment|assets|liabilities|cash flow|year ended|quarter ended)\b",
+    re.IGNORECASE,
+)
 log = logging.getLogger("document_links_ingest")
 
 
@@ -81,6 +89,27 @@ class DocumentFailure:
     document_id: str
     status: str
     detail: str
+
+
+def markdown_table(rows: list[list[Any]], table_number: int) -> str | None:
+    cleaned = [
+        [re.sub(r"\s+", " ", str(cell or "")).strip().replace("|", "\\|")[:500] for cell in row[:20]]
+        for row in rows[:100]
+        if isinstance(row, list)
+    ]
+    width = max((len(row) for row in cleaned), default=0)
+    if len(cleaned) < 2 or width < 2:
+        return None
+    cleaned = [row + [""] * (width - len(row)) for row in cleaned]
+    if sum(bool(re.search(r"\d", cell)) for row in cleaned for cell in row) < 2:
+        return None
+    headers = [cell or f"Column {index + 1}" for index, cell in enumerate(cleaned[0])]
+    return "\n".join([
+        f"### Extracted table {table_number}",
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+        *("| " + " | ".join(row) + " |" for row in cleaned[1:]),
+    ])
 
 
 def public_document_url(value: str) -> str:
@@ -262,7 +291,14 @@ def select_companies(
     candidates: list[str] = []
     for key in grouped:
         state = prior.get(key)
-        if not state or state.get("Status") not in {"enabled", "not_enabled"}:
+        if (
+            not state
+            or state.get("Status") not in {"enabled", "not_enabled"}
+            or (
+                state.get("Status") == "enabled"
+                and int(state.get("CorpusVersion") or 0) < CORPUS_VERSION
+            )
+        ):
             candidates.append(key)
     return sorted(candidates)[shard_index::shard_count][:batch_size]
 
@@ -298,9 +334,29 @@ def markdown_from_pdf(
                     raise DocumentExtractionError(
                         f"PDF text extraction was too thin and OCR failed: {type(exc).__name__}: {exc}"
                     ) from exc
+        table_count = 0
+        for index, page in enumerate(pdf):
+            if table_count >= MAX_TABLES_PER_DOCUMENT:
+                break
+            if not TABLE_PAGE_PATTERN.search(pages[index]) or len(re.findall(r"\d", pages[index])) < 6:
+                continue
+            try:
+                for table in page.find_tables().tables:
+                    rendered = markdown_table(table.extract(), table_count + 1)
+                    if rendered:
+                        pages[index] = f"{pages[index]}\n\n{rendered}"
+                        table_count += 1
+                    if table_count >= MAX_TABLES_PER_DOCUMENT:
+                        break
+            except Exception as exc:
+                log.debug("Table extraction skipped on page %d: %s", index + 1, type(exc).__name__)
     finally:
         pdf.close()
-    text = "\n\n".join(page for page in pages if page)
+    text = "\n\n".join(
+        f"## Page {index + 1}\n\n{page}"
+        for index, page in enumerate(pages)
+        if page
+    )
     if len(text) < MIN_EXTRACTED_CHARS:
         raise DocumentExtractionError("PDF text extraction was too thin after OCR")
     title = re.sub(r"\s+", " ", str(document.get("company_name") or document["scrip_code"])).strip()
@@ -368,30 +424,43 @@ def prepare_company(key: str, documents: list[dict[str, Any]], library_root: Pat
 def build_deterministic_evidence(record: Any, markdown: str) -> list[dict[str, Any]]:
     evidence = []
     seen = set()
-    for source_offset, source in document_windows(
-        markdown,
-        max_chars=ANALYSIS_WINDOW_CHARS,
-        max_windows=MAX_WINDOWS_PER_DOCUMENT,
-    ):
-        text = source.strip()
-        if source_offset == 0 and text.startswith("---"):
-            _prefix, separator, remainder = text.partition("\n---")
-            if separator:
-                text = remainder.lstrip("-\n ")
-        if len(text) > EVIDENCE_PASSAGE_CHARS:
-            end = max(
-                text.rfind("\n\n", 900, EVIDENCE_PASSAGE_CHARS),
-                text.rfind(". ", 900, EVIDENCE_PASSAGE_CHARS),
+    body = markdown
+    if body.startswith("---"):
+        _prefix, separator, remainder = body.partition("\n---")
+        if separator:
+            body = remainder.lstrip("-\n ")
+    headings = [
+        (match.start(), match.group(2).strip())
+        for match in re.finditer(r"^(#{1,4})\s+(.+?)\s*$", body, re.MULTILINE)
+    ]
+    source_offset = 0
+    while source_offset < len(body) and len(evidence) < MAX_EVIDENCE_PASSAGES_PER_DOCUMENT:
+        hard_end = min(len(body), source_offset + EVIDENCE_PASSAGE_CHARS)
+        end = hard_end
+        if hard_end < len(body):
+            boundary = max(
+                body.rfind("\n\n", source_offset + 900, hard_end),
+                body.rfind(". ", source_offset + 900, hard_end),
             )
-            text = text[:end + 1 if end >= 900 else EVIDENCE_PASSAGE_CHARS].strip()
+            if boundary >= source_offset + 900:
+                end = boundary + (1 if body[boundary] == "." else 2)
+        text = body[source_offset:end].strip()
         if len(text) < 12:
+            source_offset = max(end, source_offset + 1)
             continue
-        identity = hashlib.sha256(re.sub(r"\s+", " ", text).lower().encode("utf-8")).hexdigest()
+        identity = hashlib.sha256(
+            f"{record.document_id}|{re.sub(r'\s+', ' ', text).lower()}".encode("utf-8")
+        ).hexdigest()
         if identity in seen:
+            source_offset = max(end - EVIDENCE_PASSAGE_OVERLAP_CHARS, source_offset + 1)
             continue
         seen.add(identity)
-        headings = [match.group(2).strip() for match in re.finditer(r"^(#{1,4})\s+(.+?)\s*$", markdown[:source_offset + 1], re.MULTILINE)]
+        active_heading = next(
+            (heading for offset, heading in reversed(headings) if offset <= source_offset),
+            None,
+        )
         evidence.append({
+            "evidence_id": f"ev-{identity[:24]}",
             "claim_type": "business_fact",
             "statement": text,
             "metric": None,
@@ -403,10 +472,15 @@ def build_deterministic_evidence(record: Any, markdown: str) -> list[dict[str, A
                 "source_pdf": record.source_pdf,
                 "filing_date": record.filing_date,
                 "title": record.title,
-                "heading": headings[-1] if headings else None,
+                "heading": active_heading,
                 "quote": text,
+                "evidence_id": f"ev-{identity[:24]}",
+                "source_offset": source_offset,
             },
         })
+        if end >= len(body):
+            break
+        source_offset = max(end - EVIDENCE_PASSAGE_OVERLAP_CHARS, source_offset + 1)
     return evidence
 
 
@@ -422,7 +496,11 @@ def seed_deterministic_evidence_caches(
         if record.company_key != key:
             continue
         cache_path = claims_root / claim_cache_name(record)
-        if load_cached_claims(cache_path, record) is not None:
+        cached = load_cached_claims(cache_path, record)
+        if cached is not None and all(
+            isinstance(claim, dict) and str(claim.get("evidence_id") or "").startswith("ev-")
+            for claim in cached
+        ):
             continue
         markdown = paths[record.document_id].read_text(encoding="utf-8", errors="replace")
         write_cached_claims(cache_path, record, build_deterministic_evidence(record, markdown))
@@ -449,6 +527,7 @@ def record_direct_state(
         "RowKey": key,
         "Status": status,
         "AskAiEnabled": status == "enabled",
+        "CorpusVersion": CORPUS_VERSION,
         "DocumentCount": len(documents),
         "UsableDocumentCount": usable_count,
         "UnavailableDocumentCount": unavailable_count,
@@ -470,6 +549,7 @@ def initialize_company_audit(store: AzureStore, grouped: dict[str, list[dict[str
             "RowKey": key,
             "Status": "pending",
             "AskAiEnabled": False,
+            "CorpusVersion": CORPUS_VERSION,
             "DocumentCount": len(documents),
             "UsableDocumentCount": 0,
             "UnavailableDocumentCount": 0,

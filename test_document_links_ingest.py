@@ -11,6 +11,16 @@ import document_links_ingest as ingest
 
 
 class DocumentLinkIngestTests(unittest.TestCase):
+    def test_markdown_table_preserves_financial_layout(self):
+        rendered = ingest.markdown_table([
+            ["Particulars", "FY24", "FY25"],
+            ["Revenue", "680.99", "804.09"],
+            ["EBITDA margin", "12.75%", "12.11%"],
+        ], 1)
+        self.assertIn("| Particulars | FY24 | FY25 |", rendered)
+        self.assertIn("| Revenue | 680.99 | 804.09 |", rendered)
+        self.assertIn("| EBITDA margin | 12.75% | 12.11% |", rendered)
+
     def test_reclaims_expired_company_lease_after_cancelled_run(self):
         now = datetime(2026, 9, 18, 14, 0, tzinfo=timezone.utc)
 
@@ -53,10 +63,15 @@ class DocumentLinkIngestTests(unittest.TestCase):
         documents = [{"id": "a", "pdf_url": "https://issuer.example/a.pdf"}]
         current_hash = ingest.source_set_hash(documents)
         self.assertEqual(ingest.select_companies({"ISSUER-500001": documents}, [], 1), ["ISSUER-500001"])
-        state = [{"RowKey": "ISSUER-500001", "Status": "enabled", "SourceSetHash": current_hash, "UpdatedAt": "2026-09-18T00:00:00+00:00"}]
+        state = [{"RowKey": "ISSUER-500001", "Status": "enabled", "CorpusVersion": ingest.CORPUS_VERSION, "SourceSetHash": current_hash, "UpdatedAt": "2026-09-18T00:00:00+00:00"}]
         self.assertEqual(ingest.select_companies({"ISSUER-500001": documents}, state, 1), [])
         changed = [{"id": "a", "pdf_url": "https://issuer.example/new-a.pdf"}]
         self.assertEqual(ingest.select_companies({"ISSUER-500001": changed}, state, 1), [])
+
+    def test_requeues_enabled_company_when_corpus_version_is_stale(self):
+        documents = [{"id": "a", "pdf_url": "https://issuer.example/a.pdf"}]
+        state = [{"RowKey": "ISSUER-500001", "Status": "enabled", "CorpusVersion": ingest.CORPUS_VERSION - 1}]
+        self.assertEqual(ingest.select_companies({"ISSUER-500001": documents}, state, 1), ["ISSUER-500001"])
 
     def test_retries_company_processing_failure_without_delay(self):
         documents = [{"id": "a", "pdf_url": "https://issuer.example/a.pdf"}]
@@ -169,6 +184,26 @@ class DocumentLinkIngestTests(unittest.TestCase):
             self.assertEqual(seeded, 1)
             self.assertTrue(cached)
             self.assertEqual(cached[0]["citation"]["document_id"], records[0].document_id)
+
+    def test_deterministic_evidence_covers_deep_document_facts(self):
+        record = type("Record", (), {
+            "document_id": "ff-" + "a" * 24,
+            "content_sha256": "b" * 64,
+            "source_pdf": "https://issuer.example/annual-report.pdf",
+            "filing_date": "2025-03-31",
+            "title": "FY25 Annual Report",
+        })()
+        markdown = "# Annual Report\n\n" + "\n\n".join(
+            f"Section {index}: operations and financial discussion for business area {index}."
+            for index in range(2_000)
+        )
+        insertion = 54_321
+        markdown = markdown[:insertion] + " Established in 1987, the company manufactures minerals. " + markdown[insertion:]
+        evidence = ingest.build_deterministic_evidence(record, markdown)
+        self.assertGreater(len(evidence), 8)
+        self.assertTrue(any("Established in 1987" in item["statement"] for item in evidence))
+        self.assertEqual(len({item["evidence_id"] for item in evidence}), len(evidence))
+        self.assertTrue(all(item["citation"]["evidence_id"] == item["evidence_id"] for item in evidence))
 
 
 if __name__ == "__main__":

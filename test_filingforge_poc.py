@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+import numpy as np
+from usearch.index import Index as USearchIndex
 
 from filingforge_poc import (
     AzureStore,
@@ -431,9 +433,61 @@ class FilingForgePocTests(unittest.TestCase):
             [item["chunk_index"] for item in passages],
             list(range(len(passages))),
         )
-        for index in range(1, len(passages)):
-            self.assertIn(f"claim-{index - 1}-", passages[index]["text"])
-            self.assertIn(f"claim-{index}-", passages[index]["text"])
+        combined = "\n".join(item["text"] for item in passages)
+        positions = [combined.index(f"claim-{index}-") for index in range(6)]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_embedding_passages_preserve_evidence_ids(self):
+        record = type("Record", (), {
+            "document_id": "ff-" + "a" * 24,
+            "content_sha256": "b" * 64,
+            "title": "FY25 Annual Report",
+            "category": "annual-reports",
+            "filing_date": "2025-03-31",
+        })()
+        claims = [{
+            "evidence_id": "ev-" + "c" * 24,
+            "claim_type": "business_fact",
+            "statement": "Established in 1987.",
+            "citation": {
+                "document_id": record.document_id,
+                "heading": "Who we are",
+                "quote": "Established in 1987.",
+                "evidence_id": "ev-" + "c" * 24,
+            },
+        }]
+        passages = build_document_embedding_passages([record], claims)
+        self.assertEqual(passages[0]["evidence_ids"], ["ev-" + "c" * 24])
+
+    def test_embedding_index_writes_searchable_hnsw_artifact(self):
+        with tempfile.TemporaryDirectory() as temp:
+            company = Path(temp) / "TEST-500001"
+            filing = company / "annual-reports" / "2025-03-31_Report.md"
+            filing.parent.mkdir(parents=True)
+            filing.write_text("# Report\n\nEstablished in 1987.", encoding="utf-8")
+            record = build_document_record(company, filing)
+            evidence_id = "ev-" + "d" * 24
+            claims = [{
+                "evidence_id": evidence_id,
+                "claim_type": "business_fact",
+                "statement": "Established in 1987.",
+                "citation": {
+                    "document_id": record.document_id,
+                    "heading": "Who we are",
+                    "quote": "Established in 1987.",
+                    "evidence_id": evidence_id,
+                },
+            }]
+            output = Path(temp) / "output"
+            _metadata_path, _vectors_path, metadata = build_document_embedding_index(
+                FakeNvidiaClient(), record.company_key, [record], claims, output
+            )
+            ann_path = output / "retrieval-hnsw.usearch"
+            self.assertTrue(ann_path.exists())
+            self.assertEqual(metadata["documents"][0]["evidence_ids"], [evidence_id])
+            index = USearchIndex.restore(str(ann_path), view=False)
+            query = np.asarray([1.0] + [0.0] * 2047, dtype=np.float32)
+            self.assertEqual(list(index.search(query, 1).keys), [0])
 
     def test_cli_accepts_six_month_window(self):
         with mock.patch.object(sys, "argv", ["filingforge_poc.py", "--years", "0.5"]):
