@@ -448,8 +448,9 @@ def build_deterministic_evidence(record: Any, markdown: str) -> list[dict[str, A
         if len(text) < 12:
             source_offset = max(end, source_offset + 1)
             continue
+        normalized_text = re.sub(r"\s+", " ", text).lower()
         identity = hashlib.sha256(
-            f"{record.document_id}|{re.sub(r'\s+', ' ', text).lower()}".encode("utf-8")
+            f"{record.document_id}|{normalized_text}".encode("utf-8")
         ).hexdigest()
         if identity in seen:
             source_offset = max(end - EVIDENCE_PASSAGE_OVERLAP_CHARS, source_offset + 1)
